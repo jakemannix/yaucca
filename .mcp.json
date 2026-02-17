@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "yaucca": {
+      "command": "uv",
+      "args": ["run", "python", "-m", "yaucca.mcp_server"],
+      "env": {}
+    }
+  }
+}

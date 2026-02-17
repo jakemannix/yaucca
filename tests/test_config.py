@@ -1,0 +1,78 @@
+"""Tests for yaucca.config module."""
+
+from unittest.mock import patch
+
+from yaucca.config import AgentConfig, LettaConfig, Settings, SummarizationConfig
+
+
+class TestLettaConfig:
+    def test_defaults(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            config = LettaConfig(base_url="http://localhost:8283")
+            assert config.base_url == "http://localhost:8283"
+            assert config.api_key is None
+
+    def test_env_override(self) -> None:
+        with patch.dict("os.environ", {"LETTA_BASE_URL": "https://api.letta.com", "LETTA_API_KEY": "sk-test"}):
+            config = LettaConfig()
+            assert config.base_url == "https://api.letta.com"
+            assert config.api_key == "sk-test"
+
+
+class TestAgentConfig:
+    def test_defaults(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            config = AgentConfig()
+            assert config.agent_id is None
+
+    def test_env_override(self) -> None:
+        with patch.dict("os.environ", {"YAUCCA_AGENT_ID": "agent-abc-123"}):
+            config = AgentConfig()
+            assert config.agent_id == "agent-abc-123"
+
+
+class TestSummarizationConfig:
+    def test_defaults(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            config = SummarizationConfig()
+            assert config.enabled is True
+            assert config.model == ""
+            assert config.min_exchanges == 3
+            assert config.min_chars == 2000
+            assert config.timeout == 90
+            assert config.max_transcript_chars == 100_000
+            assert config.claude_command == "claude"
+
+    def test_env_overrides(self) -> None:
+        env = {
+            "YAUCCA_SUMMARY_ENABLED": "false",
+            "YAUCCA_SUMMARY_MODEL": "haiku",
+            "YAUCCA_SUMMARY_MIN_EXCHANGES": "5",
+            "YAUCCA_SUMMARY_MIN_CHARS": "5000",
+            "YAUCCA_SUMMARY_TIMEOUT": "120",
+            "YAUCCA_SUMMARY_MAX_TRANSCRIPT_CHARS": "50000",
+            "YAUCCA_SUMMARY_CLAUDE_COMMAND": "/usr/local/bin/claude",
+        }
+        with patch.dict("os.environ", env):
+            config = SummarizationConfig()
+            assert config.enabled is False
+            assert config.model == "haiku"
+            assert config.min_exchanges == 5
+            assert config.min_chars == 5000
+            assert config.timeout == 120
+            assert config.max_transcript_chars == 50000
+            assert config.claude_command == "/usr/local/bin/claude"
+
+
+class TestSettings:
+    def test_aggregated(self) -> None:
+        with patch.dict("os.environ", {"LETTA_BASE_URL": "http://test:8283", "YAUCCA_AGENT_ID": "agent-xyz"}):
+            settings = Settings()
+            assert settings.letta.base_url == "http://test:8283"
+            assert settings.agent.agent_id == "agent-xyz"
+
+    def test_includes_summary(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            settings = Settings()
+            assert settings.summary.enabled is True
+            assert settings.summary.min_exchanges == 3
