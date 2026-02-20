@@ -16,7 +16,7 @@ from letta_client import AsyncLetta
 from mcp.server.fastmcp import FastMCP
 
 from yaucca.config import get_settings
-from yaucca.letta_utils import extract_archive_id
+from yaucca.letta_utils import extract_archive_id, resolve_archive_id_from_list
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(name)s: %(message)s")
 logger = logging.getLogger("yaucca.mcp")
@@ -58,6 +58,17 @@ async def _resolve_archive_id() -> str | None:
         return _archive_id
     if not _letta or not _agent_id:
         return None
+
+    # Primary: query archives attached to this agent
+    try:
+        archives = await _letta.archives.list(agent_id=_agent_id)
+        _archive_id = resolve_archive_id_from_list(archives)
+        if _archive_id:
+            return _archive_id
+    except Exception:
+        pass
+
+    # Fallback: extract from existing passage
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
@@ -131,12 +142,9 @@ async def insert_archival_memory(text: str) -> str:
     """
     assert _letta and _agent_id
     archive_id = await _resolve_archive_id()
-    if archive_id:
-        await _letta.archives.passages.create(archive_id, text=text)
-    else:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            await _letta.agents.passages.create(_agent_id, text=text)
+    if not archive_id:
+        return "Error: could not resolve archive_id for agent"
+    await _letta.archives.passages.create(archive_id, text=text)
     return "Memory archived successfully"
 
 

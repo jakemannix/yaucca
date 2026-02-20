@@ -8,7 +8,7 @@ from yaucca.config import AgentConfig, LettaConfig, Settings, SummarizationConfi
 class TestLettaConfig:
     def test_defaults(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
-            config = LettaConfig(base_url="http://localhost:8283")
+            config = LettaConfig(base_url="http://localhost:8283", _env_file=None)
             assert config.base_url == "http://localhost:8283"
             assert config.api_key is None
 
@@ -22,7 +22,7 @@ class TestLettaConfig:
 class TestAgentConfig:
     def test_defaults(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
-            config = AgentConfig()
+            config = AgentConfig(_env_file=None)
             assert config.agent_id is None
 
     def test_env_override(self) -> None:
@@ -34,7 +34,7 @@ class TestAgentConfig:
 class TestSummarizationConfig:
     def test_defaults(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
-            config = SummarizationConfig()
+            config = SummarizationConfig(_env_file=None)
             assert config.enabled is True
             assert config.model == ""
             assert config.min_exchanges == 3
@@ -73,6 +73,6 @@ class TestSettings:
 
     def test_includes_summary(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
-            settings = Settings()
+            settings = Settings(_env_file=None)
             assert settings.summary.enabled is True
             assert settings.summary.min_exchanges == 3

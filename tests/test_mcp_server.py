@@ -67,20 +67,29 @@ class TestInsertArchivalMemory:
         assert "archived" in result.lower()
         mock_letta.archives.passages.create.assert_called_once_with("archive-001", text="New learning")
 
-    async def test_resolves_archive_id(self, mock_letta: AsyncMock) -> None:
+    async def test_resolves_archive_id_from_archives_list(self, mock_letta: AsyncMock) -> None:
+        archive = AsyncMock()
+        archive.id = "archive-from-list"
+        mock_letta.archives.list.return_value = [archive]
+        result = await mcp_mod.insert_archival_memory("New learning")
+        assert "archived" in result.lower()
+        assert mcp_mod._archive_id == "archive-from-list"
+
+    async def test_resolves_archive_id_from_passage_fallback(self, mock_letta: AsyncMock) -> None:
+        mock_letta.archives.list.side_effect = Exception("Not supported")
         mock_letta.agents.passages.list.return_value = [
             make_passage(passage_id="p1"),
         ]
         result = await mcp_mod.insert_archival_memory("New learning")
         assert "archived" in result.lower()
-        # Should have resolved archive_id from passage
         assert mcp_mod._archive_id == "archive-001"
 
-    async def test_fallback_when_no_archive(self, mock_letta: AsyncMock) -> None:
+    async def test_error_when_no_archive(self, mock_letta: AsyncMock) -> None:
+        mock_letta.archives.list.return_value = []
         mock_letta.agents.passages.list.return_value = []
         result = await mcp_mod.insert_archival_memory("New learning")
-        assert "archived" in result.lower()
-        mock_letta.agents.passages.create.assert_called_once()
+        assert "error" in result.lower()
+        mock_letta.archives.passages.create.assert_not_called()
 
 
 class TestListMemoryBlocks:
