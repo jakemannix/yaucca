@@ -7,12 +7,14 @@ Two subcommands:
                   renders XML context, and outputs to stdout as additionalContext.
 
   stop          — Fired on Stop (after each assistant turn completes).
-                  Two-layer persistence:
+                  Three-layer persistence:
                     Layer 1: Persists raw turns as individual archival passages
                              tagged "exchange" (always runs).
                     Layer 2: When summarization threshold is met, generates an
                              LLM summary via `claude -p` and persists it tagged
                              "summary" (non-catastrophic if it fails).
+                    Layer 3: Updates the 'context' memory block via `claude -p`
+                             so the next session starts oriented on recent work.
 
 Both use the synchronous Letta client (short-lived scripts, no async benefit).
 All diagnostic logging goes to stderr so stdout stays clean for Claude Code.
@@ -344,6 +346,77 @@ def _should_summarize(new_turn_count: int, new_chars: int, min_exchanges: int, m
     return new_turn_count >= min_exchanges or new_chars >= min_chars
 
 
+# --- Context block update ---
+
+
+def _build_context_update_prompt(
+    turns: list[Turn],
+    project_name: str,
+    cwd: str,
+    summary: str | None,
+    max_chars: int,
+) -> str:
+    """Build a prompt for claude -p to generate a context block update.
+
+    If a session summary is available, uses that as primary input (cheaper/faster).
+    Otherwise falls back to the raw transcript.
+    """
+    now = datetime.now(UTC).strftime("%Y-%m-%d")
+
+    if summary:
+        source_text = f"--- Session Summary ---\n{summary}"
+    else:
+        source_text = f"--- Transcript ---\n{_format_transcript_for_summary(turns, max_chars)}"
+
+    return f"""Generate a concise "context" memory block for a Claude Code agent's persistent memory.
+
+This block is loaded at the START of the next conversation to orient the agent on what was
+recently worked on. It should be 3-8 lines max. Use this exact format:
+
+Session: {now}. <one-line description of what repo/project was active>
+
+## Previous session recap
+- <2-4 bullet points of what was accomplished>
+
+## Current state
+- <1-2 bullets: what's in progress, what's next, any blockers>
+
+Project: {project_name}
+Working directory: {cwd}
+
+{source_text}
+
+Output ONLY the context block content — no preamble, no markdown fences, no explanation."""
+
+
+def _update_context_block(
+    client: Any,
+    agent_id: str,
+    turns: list[Turn],
+    project_name: str,
+    cwd: str,
+    summary: str | None,
+    summary_config: SummarizationConfig,
+) -> None:
+    """Generate and persist an updated context block via claude -p + Letta.
+
+    Best-effort: logs warnings on failure but never raises.
+    """
+    prompt = _build_context_update_prompt(
+        turns, project_name, cwd, summary, summary_config.max_transcript_chars
+    )
+    context_value = _summarize_with_claude(prompt, summary_config)
+    if not context_value:
+        logger.warning("Context block update failed — claude -p returned nothing")
+        return
+
+    try:
+        client.agents.blocks.update("context", agent_id=agent_id, value=context_value)
+        logger.info("Updated context memory block (%d chars)", len(context_value))
+    except Exception as e:
+        logger.warning("Failed to update context block: %s", e)
+
+
 # --- Archive persistence ---
 
 
@@ -502,12 +575,14 @@ def session_start(hook_input: dict[str, Any]) -> None:
 
 
 def stop(hook_input: dict[str, Any]) -> None:
-    """Handle Stop hook: persist turns and optionally summarize.
+    """Handle Stop hook: persist turns, optionally summarize, and update context.
 
-    Two-layer persistence:
+    Three-layer persistence:
       Layer 1: Always persist raw turns as tagged archival passages.
       Layer 2: When threshold is met, generate and persist an LLM summary.
                If summarization fails, log error — turns are already safe.
+      Layer 3: Always update the 'context' memory block via claude -p so the
+               next session starts with fresh orientation on recent work.
     """
     if os.environ.get("YAUCCA_SKIP_HOOKS"):
         return
@@ -571,6 +646,8 @@ def stop(hook_input: dict[str, Any]) -> None:
     logger.info("Persisted %d raw turns to archival memory", len(new_turns))
 
     # Layer 2: Check if we should do full summarization
+    summary: str | None = None
+    all_turns: list[Turn] = []
     summary_config = settings.summary
 
     # Extract turns since last summary for threshold check
@@ -609,6 +686,22 @@ def stop(hook_input: dict[str, Any]) -> None:
                 logger.info("Persisted LLM-generated session summary (%d turns)", len(all_turns))
             else:
                 logger.error("Summarization failed — raw turns already persisted")
+
+    # Layer 3: Update the context memory block so the next session starts oriented.
+    # Uses the summary if one was just generated, otherwise falls back to raw turns.
+    # Reuse all_turns from Layer 2 if available, otherwise extract fresh.
+    if not all_turns:
+        all_turns, _, _ = _extract_turns(transcript_path, start_line=0)
+    if all_turns:
+        _update_context_block(
+            client,
+            agent_id,
+            all_turns,
+            project_name,
+            cwd,
+            summary,
+            summary_config,
+        )
 
     # Save session state (always, even if summarization was skipped/failed)
     _save_session_state(state)
