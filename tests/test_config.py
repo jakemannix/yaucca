@@ -2,7 +2,7 @@
 
 from unittest.mock import patch
 
-from yaucca.config import AgentConfig, LettaConfig, Settings, SummarizationConfig
+from yaucca.config import AgentConfig, CloudConfig, LettaConfig, Settings, SummarizationConfig
 
 
 class TestLettaConfig:
@@ -17,6 +17,20 @@ class TestLettaConfig:
             config = LettaConfig()
             assert config.base_url == "https://api.letta.com"
             assert config.api_key == "sk-test"
+
+
+class TestCloudConfig:
+    def test_defaults(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            config = CloudConfig(_env_file=None)
+            assert config.url == "http://localhost:8283"
+            assert config.auth_token is None
+
+    def test_env_override(self) -> None:
+        with patch.dict("os.environ", {"YAUCCA_URL": "https://yaucca.modal.run", "YAUCCA_AUTH_TOKEN": "secret"}):
+            config = CloudConfig()
+            assert config.url == "https://yaucca.modal.run"
+            assert config.auth_token == "secret"
 
 
 class TestAgentConfig:
@@ -70,6 +84,11 @@ class TestSettings:
             settings = Settings()
             assert settings.letta.base_url == "http://test:8283"
             assert settings.agent.agent_id == "agent-xyz"
+
+    def test_includes_cloud(self) -> None:
+        with patch.dict("os.environ", {"YAUCCA_URL": "https://test.modal.run"}):
+            settings = Settings()
+            assert settings.cloud.url == "https://test.modal.run"
 
     def test_includes_summary(self) -> None:
         with patch.dict("os.environ", {}, clear=True):

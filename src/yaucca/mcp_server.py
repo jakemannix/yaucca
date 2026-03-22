@@ -1,82 +1,53 @@
-"""FastMCP server with Letta memory tools for Claude Code.
+"""FastMCP server with cloud-backed memory tools for Claude Code.
 
-Exposes 6 tools for interacting with Letta's persistent memory system.
+Exposes 6 tools for interacting with yaucca's persistent memory system.
 Runs as a stdio MCP server that Claude Code connects to via .mcp.json.
+All calls proxy through the yaucca cloud HTTP API.
 
 All logging goes to stderr (stdout is the JSON-RPC protocol channel).
 """
 
 import logging
 import sys
-import warnings
 from contextlib import asynccontextmanager
 from typing import Any
 
-from letta_client import AsyncLetta
+import httpx
 from mcp.server.fastmcp import FastMCP
 
 from yaucca.config import get_settings
-from yaucca.letta_utils import extract_archive_id, resolve_archive_id_from_list
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(name)s: %(message)s")
 logger = logging.getLogger("yaucca.mcp")
 
 # Module-level state, initialized during server lifespan
-_letta: AsyncLetta | None = None
-_agent_id: str | None = None
-_archive_id: str | None = None
+_client: httpx.AsyncClient | None = None
 
 
 @asynccontextmanager
 async def lifespan(server: FastMCP) -> Any:
-    """Initialize Letta client on startup."""
-    global _letta, _agent_id
+    """Initialize HTTP client on startup."""
+    global _client
     settings = get_settings()
 
-    kwargs: dict[str, Any] = {"base_url": settings.letta.base_url}
-    if settings.letta.api_key:
-        kwargs["token"] = settings.letta.api_key
-    _letta = AsyncLetta(**kwargs)
+    headers: dict[str, str] = {}
+    if settings.cloud.auth_token:
+        headers["Authorization"] = f"Bearer {settings.cloud.auth_token}"
 
-    _agent_id = settings.agent.agent_id
-    if not _agent_id:
-        logger.error("YAUCCA_AGENT_ID not set")
-        sys.exit(1)
+    _client = httpx.AsyncClient(
+        base_url=settings.cloud.url,
+        headers=headers,
+        timeout=30.0,
+    )
 
-    logger.info("Connected to Letta at %s, agent=%s", settings.letta.base_url, _agent_id)
+    logger.info("Connected to yaucca cloud at %s", settings.cloud.url)
     yield
+    await _client.aclose()
+    _client = None
     logger.info("Shutting down yaucca MCP server")
 
 
 mcp = FastMCP("yaucca", lifespan=lifespan)
-
-
-async def _resolve_archive_id() -> str | None:
-    """Lazily resolve and cache the agent's archive ID."""
-    global _archive_id
-    if _archive_id:
-        return _archive_id
-    if not _letta or not _agent_id:
-        return None
-
-    # Primary: query archives attached to this agent
-    try:
-        archives = await _letta.archives.list(agent_id=_agent_id)
-        _archive_id = resolve_archive_id_from_list(archives)
-        if _archive_id:
-            return _archive_id
-    except Exception:
-        pass
-
-    # Fallback: extract from existing passage
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            passages = await _letta.agents.passages.list(_agent_id, limit=1)
-        _archive_id = extract_archive_id(passages)
-    except Exception:
-        pass
-    return _archive_id
 
 
 @mcp.tool()
@@ -85,9 +56,12 @@ async def get_memory_block(block_name: str) -> str:
 
     Returns the current value of the specified memory block.
     """
-    assert _letta and _agent_id
-    block = await _letta.agents.blocks.retrieve(block_name, agent_id=_agent_id)
-    return block.value or ""
+    assert _client is not None
+    resp = await _client.get(f"/api/blocks/{block_name}")
+    if resp.status_code == 404:
+        return f"Block '{block_name}' not found"
+    resp.raise_for_status()
+    return resp.json().get("value", "")
 
 
 @mcp.tool()
@@ -97,8 +71,11 @@ async def update_memory_block(block_name: str, value: str) -> str:
     IMPORTANT: This replaces the entire block value. Read the block first,
     modify the content, then write the full updated value back.
     """
-    assert _letta and _agent_id
-    await _letta.agents.blocks.update(block_name, agent_id=_agent_id, value=value)
+    assert _client is not None
+    resp = await _client.put(f"/api/blocks/{block_name}", json={"value": value})
+    if resp.status_code == 404:
+        return f"Block '{block_name}' not found"
+    resp.raise_for_status()
     return f"Updated memory block '{block_name}'"
 
 
@@ -109,27 +86,10 @@ async def search_archival_memory(query: str, count: int = 10) -> str:
     Uses semantic similarity search over all stored memories.
     Returns matching entries ranked by relevance.
     """
-    assert _letta and _agent_id
-
-    # Try semantic search first (Letta server >= 0.14+)
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            result = await _letta.agents.passages.search(
-                _agent_id,
-                query=query,
-                top_k=count,
-            )
-        entries = [{"text": r.content, "id": r.id} for r in result.results]
-        return str(entries)
-    except Exception:
-        pass
-
-    # Fallback: text-based substring search
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        results = await _letta.agents.passages.list(_agent_id, search=query, limit=count)
-    entries = [{"text": r.text, "id": r.id} for r in results]
+    assert _client is not None
+    resp = await _client.get("/api/passages/search", params={"q": query, "top_k": count})
+    resp.raise_for_status()
+    entries = [{"text": p["text"], "id": p["id"]} for p in resp.json()]
     return str(entries)
 
 
@@ -140,36 +100,35 @@ async def insert_archival_memory(text: str) -> str:
     Use this for experiences, learnings, and insights that don't fit in core memory blocks.
     Entries are embedded for later semantic search.
     """
-    assert _letta and _agent_id
-    archive_id = await _resolve_archive_id()
-    if not archive_id:
-        return "Error: could not resolve archive_id for agent"
-    await _letta.archives.passages.create(archive_id, text=text)
+    assert _client is not None
+    resp = await _client.post("/api/passages", json={"text": text})
+    resp.raise_for_status()
     return "Memory archived successfully"
 
 
 @mcp.tool()
 async def list_memory_blocks() -> str:
     """List all available core memory blocks with their sizes."""
-    assert _letta and _agent_id
-    blocks_page = await _letta.agents.blocks.list(_agent_id)
-    block_items = blocks_page.items if hasattr(blocks_page, "items") else blocks_page
-    blocks = [{"label": b.label, "value_length": len(b.value) if b.value else 0} for b in block_items]
+    assert _client is not None
+    resp = await _client.get("/api/blocks")
+    resp.raise_for_status()
+    blocks = [{"label": b["label"], "value_length": len(b.get("value", ""))} for b in resp.json()]
     return str(blocks)
 
 
 @mcp.tool()
 async def get_recent_messages(count: int = 10) -> str:
     """Get recent conversation exchanges from recall memory."""
-    assert _letta and _agent_id
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        passages = await _letta.agents.passages.list(_agent_id, limit=count * 2, ascending=False)
-    exchanges = [p for p in passages if "exchange" in (getattr(p, "tags", None) or [])]
+    assert _client is not None
+    resp = await _client.get(
+        "/api/passages",
+        params={"tag": "exchange", "limit": count, "order": "desc"},
+    )
+    resp.raise_for_status()
     formatted = []
-    for p in exchanges[:count]:
-        entry: dict[str, str] = {"text": (getattr(p, "text", "") or "")[:500], "id": getattr(p, "id", "")}
-        created = getattr(p, "created_at", None)
+    for p in resp.json():
+        entry: dict[str, str] = {"text": p.get("text", "")[:500], "id": p.get("id", "")}
+        created = p.get("created_at")
         if created:
             entry["date"] = str(created)
         formatted.append(entry)

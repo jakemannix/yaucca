@@ -3,7 +3,7 @@
 Two subcommands:
 
   session_start — Fired on SessionStart (startup, resume, compact, clear).
-                  Queries Letta for memory blocks + recent tagged passages,
+                  Queries yaucca cloud for memory blocks + recent tagged passages,
                   renders XML context, and outputs to stdout as additionalContext.
 
   stop          — Fired on Stop (after each assistant turn completes).
@@ -16,7 +16,7 @@ Two subcommands:
                     Layer 3: Updates the 'context' memory block via `claude -p`
                              so the next session starts oriented on recent work.
 
-Both use the synchronous Letta client (short-lived scripts, no async benefit).
+Both use httpx to call the yaucca cloud HTTP API.
 All diagnostic logging goes to stderr so stdout stays clean for Claude Code.
 """
 
@@ -27,14 +27,14 @@ import os
 import shutil
 import subprocess
 import sys
-import warnings
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from yaucca.config import SummarizationConfig, get_settings
-from yaucca.letta_utils import extract_archive_id, resolve_archive_id_from_list
 from yaucca.prompt import RECALL_PASSAGE_LIMIT, render_full_context
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="yaucca: %(message)s")
@@ -70,18 +70,21 @@ class SessionState:
     last_summary_passage_id: str = ""
 
 
-# --- Letta client ---
+# --- Cloud API client ---
 
 
-def _get_letta_client() -> Any:
-    """Create a synchronous Letta client from settings."""
-    from letta_client import Letta
+def _cloud_client() -> tuple[httpx.Client, str]:
+    """Create an httpx client configured for the yaucca cloud API.
 
+    Returns (client, base_url).
+    """
     settings = get_settings()
-    kwargs: dict[str, Any] = {"base_url": settings.letta.base_url}
-    if settings.letta.api_key:
-        kwargs["token"] = settings.letta.api_key
-    return Letta(**kwargs)
+    base_url = settings.cloud.url
+    headers: dict[str, str] = {}
+    if settings.cloud.auth_token:
+        headers["Authorization"] = f"Bearer {settings.cloud.auth_token}"
+    client = httpx.Client(base_url=base_url, headers=headers, timeout=15.0)
+    return client, base_url
 
 
 def _read_stdin_json() -> dict[str, Any]:
@@ -309,7 +312,7 @@ def _summarize_with_claude(prompt: str, summary_config: SummarizationConfig) -> 
     # Build clean env: strip CLAUDECODE* and CLAUDE_CODE_ENTRYPOINT to prevent
     # claude from refusing to start inside another session, and set
     # YAUCCA_SKIP_HOOKS=1 to prevent recursion (stop hook) and skip SessionStart
-    # (sub-agent doesn't need Letta context).
+    # (sub-agent doesn't need memory context).
     env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDECODE") and k != "CLAUDE_CODE_ENTRYPOINT"}
     env["YAUCCA_SKIP_HOOKS"] = "1"
 
@@ -356,11 +359,7 @@ def _build_context_update_prompt(
     summary: str | None,
     max_chars: int,
 ) -> str:
-    """Build a prompt for claude -p to generate a context block update.
-
-    If a session summary is available, uses that as primary input (cheaper/faster).
-    Otherwise falls back to the raw transcript.
-    """
+    """Build a prompt for claude -p to generate a context block update."""
     now = datetime.now(UTC).strftime("%Y-%m-%d")
 
     if summary:
@@ -390,15 +389,14 @@ Output ONLY the context block content — no preamble, no markdown fences, no ex
 
 
 def _update_context_block(
-    client: Any,
-    agent_id: str,
+    client: httpx.Client,
     turns: list[Turn],
     project_name: str,
     cwd: str,
     summary: str | None,
     summary_config: SummarizationConfig,
 ) -> None:
-    """Generate and persist an updated context block via claude -p + Letta.
+    """Generate and persist an updated context block via claude -p + cloud API.
 
     Best-effort: logs warnings on failure but never raises.
     """
@@ -411,68 +409,44 @@ def _update_context_block(
         return
 
     try:
-        client.agents.blocks.update("context", agent_id=agent_id, value=context_value)
+        resp = client.put("/api/blocks/context", json={"value": context_value})
+        resp.raise_for_status()
         logger.info("Updated context memory block (%d chars)", len(context_value))
     except Exception as e:
         logger.warning("Failed to update context block: %s", e)
 
 
-# --- Archive persistence ---
-
-
-def _resolve_archive_id_sync(client: Any, agent_id: str) -> str | None:
-    """Resolve archive_id using the sync Letta client.
-
-    Tries archives.list(agent_id=...) first (works even with no passages),
-    then falls back to extracting from an existing passage.
-    Lets connection errors propagate to caller.
-    """
-    # Primary: query archives attached to this agent
-    try:
-        archives = client.archives.list(agent_id=agent_id)
-        archive_id = resolve_archive_id_from_list(archives)
-        if archive_id:
-            return archive_id
-    except Exception:
-        pass
-
-    # Fallback: extract from existing passage
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        passages = client.agents.passages.list(agent_id, limit=1)
-    return extract_archive_id(passages)
+# --- Passage persistence ---
 
 
 def _persist_turns(
-    client: Any,
-    archive_id: str,
+    client: httpx.Client,
     turns: list[Turn],
     session_id: str,
     project_name: str,
 ) -> None:
-    """Persist each turn as an individual archival passage tagged for filtering.
-
-    No exception handling — caller is responsible.
-    """
+    """Persist each turn as an individual passage tagged for filtering."""
     for turn in turns:
         text = turn.format()
-        client.archives.passages.create(
-            archive_id,
-            text=text,
-            metadata={"session_id": session_id, "project": project_name},
-            tags=["exchange"],
+        resp = client.post(
+            "/api/passages",
+            json={
+                "text": text,
+                "tags": ["exchange"],
+                "metadata": {"session_id": session_id, "project": project_name},
+            },
         )
+        resp.raise_for_status()
 
 
 def _persist_summary(
-    client: Any,
-    archive_id: str,
+    client: httpx.Client,
     summary: str,
     previous_passage_id: str,
     session_id: str,
     project_name: str,
 ) -> str | None:
-    """Persist an LLM-generated summary to Letta archival, replacing previous if exists.
+    """Persist an LLM-generated summary, replacing previous if exists.
 
     Returns the new passage ID, or None on failure.
     """
@@ -483,29 +457,49 @@ def _persist_summary(
         # Delete previous summary passage for this session if it exists
         if previous_passage_id:
             try:
-                client.archives.passages.delete(archive_id, previous_passage_id)
+                client.delete(f"/api/passages/{previous_passage_id}")
             except Exception as e:
                 logger.debug("Failed to delete previous passage %s: %s", previous_passage_id, e)
 
-        result = client.archives.passages.create(
-            archive_id,
-            text=text,
-            metadata={"session_id": session_id, "project": project_name},
-            tags=["summary"],
+        resp = client.post(
+            "/api/passages",
+            json={
+                "text": text,
+                "tags": ["summary"],
+                "metadata": {"session_id": session_id, "project": project_name},
+            },
         )
-
-        # Extract passage ID from result
-        if hasattr(result, "id"):
-            passage_id: str = result.id
-            return passage_id
-        if isinstance(result, list) and result and hasattr(result[0], "id"):
-            passage_id = result[0].id
-            return passage_id
-        return None
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("id")
 
     except Exception as e:
         logger.warning("Failed to persist summary: %s", e)
         return None
+
+
+# --- Passage-like adapter for prompt.py rendering ---
+
+
+class _PassageLike:
+    """Adapter to make cloud API passage dicts work with prompt.py's getattr-based rendering."""
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        self.text = data.get("text", "")
+        self.tags = data.get("tags", [])
+        self.created_at = data.get("created_at", "")
+        self.id = data.get("id", "")
+        self.metadata = data.get("metadata", {})
+
+
+class _BlockLike:
+    """Adapter to make cloud API block dicts work with prompt.py's getattr-based rendering."""
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        self.label = data.get("label", "")
+        self.value = data.get("value", "")
+        self.description = data.get("description", "")
+        self.limit = data.get("limit", 5000)
 
 
 # --- Hook handlers ---
@@ -514,49 +508,40 @@ def _persist_summary(
 def session_start(hook_input: dict[str, Any]) -> None:
     """Handle SessionStart hook: inject memory context into Claude Code.
 
-    Queries Letta for all memory blocks and recent tagged passages, splits
+    Queries yaucca cloud for all memory blocks and recent tagged passages, splits
     them into exchanges and summaries, and renders as XML for additionalContext.
 
-    Gracefully degrades: if Letta is unreachable, outputs nothing and exits 0.
+    Gracefully degrades: if the cloud server is unreachable, outputs nothing and exits 0.
     """
     if os.environ.get("YAUCCA_SKIP_HOOKS"):
-        return
-
-    settings = get_settings()
-    agent_id = settings.agent.agent_id
-    if not agent_id:
-        logger.warning("YAUCCA_AGENT_ID not set, skipping memory injection")
         return
 
     source = hook_input.get("source", "startup")
     logger.info("SessionStart (source=%s)", source)
 
     try:
-        client = _get_letta_client()
+        client, _ = _cloud_client()
 
         # Fetch memory blocks
-        blocks_page = client.agents.blocks.list(agent_id)
-        blocks = blocks_page.items if hasattr(blocks_page, "items") else blocks_page
+        resp = client.get("/api/blocks")
+        resp.raise_for_status()
+        blocks = [_BlockLike(b) for b in resp.json()]
 
-        # Fetch recent archival passages
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            passages = client.agents.passages.list(
-                agent_id,
-                limit=RECALL_PASSAGE_LIMIT,
-                ascending=False,
-            )
+        # Fetch recent passages
+        resp = client.get("/api/passages", params={"limit": RECALL_PASSAGE_LIMIT, "order": "desc"})
+        resp.raise_for_status()
+        all_passages = [_PassageLike(p) for p in resp.json()]
 
         # Split passages by tag
-        exchanges = [p for p in passages if "exchange" in (getattr(p, "tags", None) or [])]
-        summaries = [p for p in passages if "summary" in (getattr(p, "tags", None) or [])]
-        other = [p for p in passages if p not in exchanges and p not in summaries]
+        exchanges = [p for p in all_passages if "exchange" in p.tags]
+        summaries = [p for p in all_passages if "summary" in p.tags]
+        other = [p for p in all_passages if p not in exchanges and p not in summaries]
 
         context = render_full_context(
-            blocks=list(blocks),
+            blocks=blocks,
             exchanges=exchanges,
             summaries=summaries + other,
-            archival_count=len(passages),
+            archival_count=len(all_passages),
             exchange_count=len(exchanges),
         )
 
@@ -564,13 +549,13 @@ def session_start(hook_input: dict[str, Any]) -> None:
         print(context)
         logger.info(
             "Injected %d blocks, %d exchanges, %d summaries",
-            len(list(blocks)),
+            len(blocks),
             len(exchanges),
             len(summaries + other),
         )
 
     except Exception as e:
-        logger.warning("Failed to load memory from Letta: %s", e)
+        logger.warning("Failed to load memory from yaucca cloud: %s", e)
         # Graceful degradation: exit 0, no output
 
 
@@ -589,11 +574,6 @@ def stop(hook_input: dict[str, Any]) -> None:
 
     # Prevent recursion if a stop hook is already active
     if hook_input.get("stop_hook_active", False):
-        return
-
-    settings = get_settings()
-    agent_id = settings.agent.agent_id
-    if not agent_id:
         return
 
     transcript_path = hook_input.get("transcript_path", "")
@@ -622,21 +602,18 @@ def stop(hook_input: dict[str, Any]) -> None:
         logger.debug("No new turns since last persistence")
         return
 
-    # Connect to Letta — fail-fast on connection errors
+    # Connect to cloud API — fail-fast on connection errors
     try:
-        client = _get_letta_client()
-        archive_id = _resolve_archive_id_sync(client, agent_id)
+        client, _ = _cloud_client()
+        # Quick health check
+        client.get("/health").raise_for_status()
     except Exception as e:
-        logger.error("Failed to connect to Letta: %s", e)
-        return
-
-    if not archive_id:
-        logger.error("Could not resolve archive_id for agent %s", agent_id)
+        logger.error("Failed to connect to yaucca cloud: %s", e)
         return
 
     # Layer 1: Persist raw turns
     try:
-        _persist_turns(client, archive_id, new_turns, session_id, project_name)
+        _persist_turns(client, new_turns, session_id, project_name)
     except Exception as e:
         logger.error("Failed to persist turns: %s", e)
         return
@@ -648,7 +625,7 @@ def stop(hook_input: dict[str, Any]) -> None:
     # Layer 2: Check if we should do full summarization
     summary: str | None = None
     all_turns: list[Turn] = []
-    summary_config = settings.summary
+    summary_config = get_settings().summary
 
     # Extract turns since last summary for threshold check
     turns_since_summary, chars_since_summary, _ = _extract_turns(
@@ -670,7 +647,6 @@ def stop(hook_input: dict[str, Any]) -> None:
             if summary:
                 passage_id = _persist_summary(
                     client,
-                    archive_id,
                     summary,
                     state.last_summary_passage_id,
                     session_id,
@@ -688,14 +664,11 @@ def stop(hook_input: dict[str, Any]) -> None:
                 logger.error("Summarization failed — raw turns already persisted")
 
     # Layer 3: Update the context memory block so the next session starts oriented.
-    # Uses the summary if one was just generated, otherwise falls back to raw turns.
-    # Reuse all_turns from Layer 2 if available, otherwise extract fresh.
     if not all_turns:
         all_turns, _, _ = _extract_turns(transcript_path, start_line=0)
     if all_turns:
         _update_context_block(
             client,
-            agent_id,
             all_turns,
             project_name,
             cwd,
@@ -708,33 +681,31 @@ def stop(hook_input: dict[str, Any]) -> None:
 
 
 def status() -> None:
-    """Show recent Letta passages and session state — for manual verification."""
-    settings = get_settings()
-    agent_id = settings.agent.agent_id
-    if not agent_id:
-        print("YAUCCA_AGENT_ID not set")
-        return
-
-    # Show recent passages
+    """Show recent passages and session state — for manual verification."""
     try:
-        client = _get_letta_client()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            passages = client.agents.passages.list(agent_id, limit=20, ascending=False)
+        client, base_url = _cloud_client()
     except Exception as e:
-        print(f"Failed to connect to Letta: {e}")
+        print(f"Failed to create cloud client: {e}")
         return
 
-    print(f"Agent: {agent_id}")
+    try:
+        resp = client.get("/api/passages", params={"limit": 20, "order": "desc"})
+        resp.raise_for_status()
+        passages = resp.json()
+    except Exception as e:
+        print(f"Failed to connect to yaucca cloud at {base_url}: {e}")
+        return
+
+    print(f"Cloud: {base_url}")
     print(f"Passages: {len(passages)} most recent\n")
 
     for p in passages:
-        tags = getattr(p, "tags", []) or []
-        text = getattr(p, "text", "")
+        tags = p.get("tags", [])
+        text = p.get("text", "")
         preview = text[:120].replace("\n", " ")
         if len(text) > 120:
             preview += "..."
-        pid = getattr(p, "id", "?")[:12]
+        pid = p.get("id", "?")[:12]
         print(f"  {pid}  tags={tags}")
         print(f"    {preview}\n")
 

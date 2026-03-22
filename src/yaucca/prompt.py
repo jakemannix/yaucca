@@ -1,6 +1,6 @@
 """Memory rendering for Claude Code context injection.
 
-Standalone functions that render Letta memory blocks, metadata, and recall
+Standalone functions that render memory blocks, metadata, and recall
 into XML sections suitable for additionalContext in SessionStart hooks.
 """
 

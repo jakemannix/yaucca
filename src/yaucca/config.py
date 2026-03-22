@@ -10,7 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class LettaConfig(BaseSettings):
-    """Letta server connection settings."""
+    """Letta server connection settings (deprecated — used only for migration)."""
 
     model_config = SettingsConfigDict(env_prefix="LETTA_", env_file=".env", extra="ignore")
 
@@ -18,12 +18,21 @@ class LettaConfig(BaseSettings):
     api_key: str | None = Field(default=None, description="Letta API key for authentication")
 
 
+class CloudConfig(BaseSettings):
+    """yaucca cloud server connection settings."""
+
+    model_config = SettingsConfigDict(env_prefix="YAUCCA_", env_file=".env", extra="ignore")
+
+    url: str = Field(default="http://localhost:8283", alias="YAUCCA_URL", description="yaucca cloud server URL")
+    auth_token: str | None = Field(default=None, alias="YAUCCA_AUTH_TOKEN", description="Bearer token for cloud API")
+
+
 class AgentConfig(BaseSettings):
     """yaucca agent-specific settings."""
 
     model_config = SettingsConfigDict(env_prefix="YAUCCA_", env_file=".env", extra="ignore")
 
-    agent_id: str | None = Field(default=None, description="Letta agent ID for yaucca")
+    agent_id: str | None = Field(default=None, description="Letta agent ID for yaucca (used for migration)")
 
 
 class SummarizationConfig(BaseSettings):
@@ -50,6 +59,7 @@ class Settings(BaseSettings):
     )
 
     letta: LettaConfig = Field(default_factory=LettaConfig)
+    cloud: CloudConfig = Field(default_factory=CloudConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     summary: SummarizationConfig = Field(default_factory=SummarizationConfig)
 
