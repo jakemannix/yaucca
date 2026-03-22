@@ -19,17 +19,17 @@ image = (
         "pydantic>=2.0.0",
         "pydantic-settings>=2.0.0",
     )
-    .copy_local_dir("src/yaucca", "/root/src/yaucca")
+    .add_local_dir("src/yaucca", "/root/src/yaucca")
 )
 
 
 @app.function(
     image=image,
     volumes={"/data": volume},
-    container_idle_timeout=300,
-    allow_concurrent_inputs=10,
+    scaledown_window=300,
     secrets=[modal.Secret.from_name("yaucca-secrets")],
 )
+@modal.concurrent(max_inputs=10)
 @modal.asgi_app()
 def serve():
     """Serve the yaucca FastAPI app with SQLite on a persistent volume."""
