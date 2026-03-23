@@ -2,12 +2,12 @@
 
 ## Status
 
-**Code: complete. Deployment and end-to-end testing: not done.**
+**Phase 1: Deployed and tested.** Cloud server running on Modal with all
+Letta data migrated (5 blocks, ~450 passages with Qwen3 embeddings).
+Vector search verified. 98 unit tests passing. Cutover of hooks/MCP
+from Letta to cloud pending user verification.
 
-All Phase 1 code is written and has 82 passing unit tests. Nothing has been
-deployed to Modal, no data has been migrated from Letta, and no end-to-end
-verification has been performed. See `modal-deployment-plan.md` for the
-remaining work.
+See `modal-deployment-plan.md` for detailed status and remaining work.
 
 ## Problem Statement
 
@@ -48,9 +48,9 @@ next-actions-by-context from his iPhone — without his laptop being open.
 │         │                                                   │
 │  ┌──────▼──────────┐     ┌──────────────────┐              │
 │  │  Storage Layer   │     │  Embedding Layer  │              │
-│  │  (SQLite +       │     │  (OpenAI text-    │              │
-│  │   sqlite-vec)    │     │   embedding-3-    │              │
-│  │                  │     │   small, 1536d)   │              │
+│  │  (SQLite +       │     │  (Qwen3-Embed-   │              │
+│  │   sqlite-vec)    │     │   ding-8B via     │              │
+│  │                  │     │  OpenRouter,1024d)│              │
 │  └─────────────────┘     └──────────────────┘              │
 │                                                             │
 │  Persistent volume: /data/yaucca.db                         │
@@ -118,9 +118,9 @@ CREATE TABLE passages (
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE VIRTUAL TABLE passages_vec USING vec0(
+CREATE VIRTUAL TABLE passages_vec_d1024 USING vec0(
     id TEXT PRIMARY KEY,
-    embedding FLOAT[1536]           -- OpenAI text-embedding-3-small
+    embedding FLOAT[1024]           -- Qwen3-Embedding-8B via OpenRouter
 );
 ```
 
