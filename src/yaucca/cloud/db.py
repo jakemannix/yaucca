@@ -3,6 +3,10 @@
 Provides persistent storage for memory blocks and archival passages with
 vector similarity search. Transport-agnostic — the caller (Modal app or
 local dev server) handles volume commits.
+
+Supports multiple embedding profiles for Matryoshka A/B testing:
+each profile is a separate vec0 virtual table at a given dimension.
+The full embedding is truncated to each profile's dimension at insert time.
 """
 
 import json
@@ -12,6 +16,22 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+
+
+@dataclass
+class EmbeddingProfile:
+    """An embedding index at a specific Matryoshka dimension."""
+
+    name: str  # e.g. "d1024", "d512"
+    dimensions: int  # e.g. 1024, 512
+
+    @property
+    def table_name(self) -> str:
+        return f"passages_vec_{self.name}"
+
+
+# Default: single profile at full Qwen3-Embedding-8B native dimension
+DEFAULT_PROFILES = [EmbeddingProfile(name="d1024", dimensions=1024)]
 
 
 @dataclass
@@ -43,13 +63,22 @@ class Database:
         db_path: Path to SQLite database file, or ":memory:" for testing.
         on_write: Optional callback invoked after any write operation.
                   Used by Modal to trigger volume.commit().
+        embedding_profiles: List of EmbeddingProfiles to maintain.
+                           Each gets its own vec0 virtual table.
     """
 
-    def __init__(self, db_path: str = ":memory:", on_write: Callable[[], None] | None = None) -> None:
+    def __init__(
+        self,
+        db_path: str = ":memory:",
+        on_write: Callable[[], None] | None = None,
+        embedding_profiles: list[EmbeddingProfile] | None = None,
+    ) -> None:
         self._db_path = db_path
         self._on_write = on_write
+        self._profiles = embedding_profiles or DEFAULT_PROFILES
         self._conn: sqlite3.Connection | None = None
         self._has_vec = False
+        self._active_profiles: list[EmbeddingProfile] = []
 
     def connect(self) -> None:
         """Open the database connection and initialize schema."""
@@ -98,27 +127,72 @@ class Database:
         """)
 
     def _try_load_vec(self) -> None:
-        """Try to load sqlite-vec extension for vector search."""
-        try:
-            import sqlite_vec
+        """Load sqlite-vec extension and create vec tables for each profile.
 
-            self.conn.enable_load_extension(True)
-            sqlite_vec.load(self.conn)
-            self.conn.enable_load_extension(False)
-            # Create vector table if it doesn't exist
-            self.conn.execute("""
-                CREATE VIRTUAL TABLE IF NOT EXISTS passages_vec USING vec0(
+        Raises ImportError if sqlite-vec is not installed.
+        Other errors (load failure, table creation) propagate as-is.
+        """
+        import sqlite_vec
+
+        self.conn.enable_load_extension(True)
+        sqlite_vec.load(self.conn)
+        self.conn.enable_load_extension(False)
+
+        for profile in self._profiles:
+            self.conn.execute(f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS {profile.table_name} USING vec0(
                     id TEXT PRIMARY KEY,
-                    embedding FLOAT[1536]
+                    embedding FLOAT[{profile.dimensions}]
                 )
             """)
-            self._has_vec = True
-        except (ImportError, Exception):
-            self._has_vec = False
+        self._has_vec = True
+        self._active_profiles = list(self._profiles)
 
     @property
     def has_vec(self) -> bool:
         return self._has_vec
+
+    @property
+    def active_profiles(self) -> list[EmbeddingProfile]:
+        """Profiles that have vec tables created (sqlite-vec loaded successfully)."""
+        return self._active_profiles
+
+    def passages_needing_backfill(self, profile_name: str) -> list[Passage]:
+        """Return passages that exist in the passages table but not in the given profile's vec table."""
+        profile = self._resolve_profile(profile_name)
+        if not profile:
+            return []
+        rows = self.conn.execute(
+            f"""
+            SELECT p.id, p.text, p.tags, p.metadata, p.created_at
+            FROM passages p
+            LEFT JOIN {profile.table_name} v ON p.id = v.id
+            WHERE v.id IS NULL
+            """,
+        ).fetchall()
+        return [self._row_to_passage(r) for r in rows]
+
+    def store_backfill_embedding(self, passage_id: str, embedding: list[float], profile_name: str) -> bool:
+        """Store an embedding for an existing passage into a specific profile. Returns True if stored."""
+        profile = self._resolve_profile(profile_name)
+        if not profile:
+            return False
+        truncated = embedding[: profile.dimensions]
+        self._store_embedding(passage_id, truncated, profile.table_name)
+        self.conn.commit()
+        self._notify_write()
+        return True
+
+    def drop_profile(self, name: str) -> bool:
+        """Drop an embedding profile's vec table. Returns True if dropped."""
+        profile = next((p for p in self._active_profiles if p.name == name), None)
+        if not profile:
+            return False
+        self.conn.execute(f"DROP TABLE IF EXISTS {profile.table_name}")
+        self.conn.commit()
+        self._active_profiles = [p for p in self._active_profiles if p.name != name]
+        self._notify_write()
+        return True
 
     # --- Block operations ---
 
@@ -176,7 +250,9 @@ class Database:
             (passage_id, text, json.dumps(tags or []), json.dumps(metadata or {}), now),
         )
         if embedding and self._has_vec:
-            self._store_embedding(passage_id, embedding)
+            for profile in self._active_profiles:
+                truncated = embedding[: profile.dimensions]
+                self._store_embedding(passage_id, truncated, profile.table_name)
         self.conn.commit()
         self._notify_write()
         return Passage(id=passage_id, text=text, tags=tags or [], metadata=metadata or {}, created_at=now)
@@ -192,7 +268,8 @@ class Database:
     def delete_passage(self, passage_id: str) -> bool:
         cursor = self.conn.execute("DELETE FROM passages WHERE id = ?", (passage_id,))
         if self._has_vec:
-            self.conn.execute("DELETE FROM passages_vec WHERE id = ?", (passage_id,))
+            for profile in self._active_profiles:
+                self.conn.execute(f"DELETE FROM {profile.table_name} WHERE id = ?", (passage_id,))
         self.conn.commit()
         deleted = cursor.rowcount > 0
         if deleted:
@@ -226,18 +303,36 @@ class Database:
 
         return [self._row_to_passage(r) for r in rows]
 
-    def search_passages(self, embedding: list[float], top_k: int = 10) -> list[Passage]:
-        """Semantic vector search using sqlite-vec."""
-        if not self._has_vec:
+    def search_passages(
+        self,
+        embedding: list[float],
+        top_k: int = 10,
+        profile_name: str | None = None,
+    ) -> list[Passage]:
+        """Semantic vector search using sqlite-vec.
+
+        Args:
+            embedding: Query embedding (will be truncated to profile dimensions).
+            top_k: Number of results.
+            profile_name: Which embedding profile to search. Defaults to first active.
+        """
+        if not self._has_vec or not self._active_profiles:
             return []
+
+        profile = self._resolve_profile(profile_name)
+        if not profile:
+            return []
+
+        truncated = embedding[: profile.dimensions]
+
         import struct
 
-        blob = struct.pack(f"{len(embedding)}f", *embedding)
+        blob = struct.pack(f"{len(truncated)}f", *truncated)
         rows = self.conn.execute(
-            """
+            f"""
             SELECT p.id, p.text, p.tags, p.metadata, p.created_at
             FROM passages p
-            JOIN passages_vec v ON p.id = v.id
+            JOIN {profile.table_name} v ON p.id = v.id
             WHERE v.embedding MATCH ?
               AND k = ?
             ORDER BY distance
@@ -248,11 +343,18 @@ class Database:
 
     # --- Helpers ---
 
-    def _store_embedding(self, passage_id: str, embedding: list[float]) -> None:
+    def _resolve_profile(self, name: str | None) -> EmbeddingProfile | None:
+        if not self._active_profiles:
+            return None
+        if name is None:
+            return self._active_profiles[0]
+        return next((p for p in self._active_profiles if p.name == name), None)
+
+    def _store_embedding(self, passage_id: str, embedding: list[float], table_name: str) -> None:
         import struct
 
         blob = struct.pack(f"{len(embedding)}f", *embedding)
-        self.conn.execute("INSERT INTO passages_vec (id, embedding) VALUES (?, ?)", (passage_id, blob))
+        self.conn.execute(f"INSERT INTO {table_name} (id, embedding) VALUES (?, ?)", (passage_id, blob))
 
     def _row_to_passage(self, row: sqlite3.Row) -> Passage:
         return Passage(

@@ -18,8 +18,9 @@ image = (
         "httpx>=0.27.0",
         "pydantic>=2.0.0",
         "pydantic-settings>=2.0.0",
+        "sqlite-vec>=0.1.0",
     )
-    .add_local_dir("src/yaucca", "/root/src/yaucca")
+    .add_local_python_source("yaucca")
 )
 
 
@@ -33,13 +34,10 @@ image = (
 @modal.asgi_app()
 def serve():
     """Serve the yaucca FastAPI app with SQLite on a persistent volume."""
-    import sys
-
-    sys.path.insert(0, "/root/src")
-
     from yaucca.cloud.server import create_app
 
-    def commit_volume():
-        volume.commit()
-
-    return create_app(db_path="/data/yaucca.db", on_write=commit_volume)
+    return create_app(
+        db_path="/data/yaucca.db",
+        on_write=lambda: None,  # Block writes don't need volume commit (low freq)
+        commit_fn=volume.commit,  # Embedding queue commits after each batch flush
+    )

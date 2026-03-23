@@ -23,8 +23,9 @@ class CloudConfig(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="YAUCCA_", env_file=".env", extra="ignore")
 
-    url: str = Field(default="http://localhost:8283", alias="YAUCCA_URL", description="yaucca cloud server URL")
+    url: str = Field(default="http://YAUCCA_URL_env_var_is_unset:0", alias="YAUCCA_URL", description="yaucca cloud server URL")
     auth_token: str | None = Field(default=None, alias="YAUCCA_AUTH_TOKEN", description="Bearer token for cloud API")
+    required: bool = Field(default=False, alias="YAUCCA_REQUIRED", description="If true, hooks fail hard (exit 1) when cloud is unreachable")
 
 
 class AgentConfig(BaseSettings):

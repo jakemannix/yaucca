@@ -334,7 +334,7 @@ def _summarize_with_claude(prompt: str, summary_config: SummarizationConfig) -> 
         logger.warning("claude -p timed out after %ds", summary_config.timeout)
         return None
     except Exception as e:
-        logger.debug("claude -p failed: %s", e)
+        logger.warning("claude -p failed: %s", e)
         return None
 
 
@@ -511,13 +511,16 @@ def session_start(hook_input: dict[str, Any]) -> None:
     Queries yaucca cloud for all memory blocks and recent tagged passages, splits
     them into exchanges and summaries, and renders as XML for additionalContext.
 
-    Gracefully degrades: if the cloud server is unreachable, outputs nothing and exits 0.
+    When YAUCCA_REQUIRED=true, exits non-zero if cloud is unreachable (failing the
+    Claude Code session). Otherwise, degrades silently.
     """
     if os.environ.get("YAUCCA_SKIP_HOOKS"):
         return
 
+    settings = get_settings()
+    required = settings.cloud.required
     source = hook_input.get("source", "startup")
-    logger.info("SessionStart (source=%s)", source)
+    logger.info("SessionStart (source=%s, required=%s)", source, required)
 
     try:
         client, _ = _cloud_client()
@@ -555,8 +558,10 @@ def session_start(hook_input: dict[str, Any]) -> None:
         )
 
     except Exception as e:
+        if required:
+            logger.error("FATAL: Memory unavailable (YAUCCA_REQUIRED=true): %s", e)
+            sys.exit(1)
         logger.warning("Failed to load memory from yaucca cloud: %s", e)
-        # Graceful degradation: exit 0, no output
 
 
 def stop(hook_input: dict[str, Any]) -> None:
@@ -602,12 +607,17 @@ def stop(hook_input: dict[str, Any]) -> None:
         logger.debug("No new turns since last persistence")
         return
 
-    # Connect to cloud API — fail-fast on connection errors
+    required = get_settings().cloud.required
+
+    # Connect to cloud API
     try:
         client, _ = _cloud_client()
         # Quick health check
         client.get("/health").raise_for_status()
     except Exception as e:
+        if required:
+            logger.error("FATAL: Cannot persist turns (YAUCCA_REQUIRED=true): %s", e)
+            sys.exit(1)
         logger.error("Failed to connect to yaucca cloud: %s", e)
         return
 
@@ -615,6 +625,9 @@ def stop(hook_input: dict[str, Any]) -> None:
     try:
         _persist_turns(client, new_turns, session_id, project_name)
     except Exception as e:
+        if required:
+            logger.error("FATAL: Turn persistence failed (YAUCCA_REQUIRED=true): %s", e)
+            sys.exit(1)
         logger.error("Failed to persist turns: %s", e)
         return
 

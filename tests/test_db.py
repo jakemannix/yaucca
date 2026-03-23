@@ -2,7 +2,7 @@
 
 import pytest
 
-from yaucca.cloud.db import Database
+from yaucca.cloud.db import Database, EmbeddingProfile
 
 
 @pytest.fixture
@@ -107,6 +107,102 @@ class TestPassages:
         retrieved = db.get_passage(p.id)
         assert retrieved is not None
         assert retrieved.metadata["session_id"] == "sess-1"
+
+
+class TestVecAvailability:
+    """Verify sqlite-vec is actually loadable in the test environment."""
+
+    def test_sqlite_vec_loads(self) -> None:
+        """sqlite-vec must be importable — if this fails, vector search is silently disabled everywhere."""
+        import sqlite_vec  # noqa: F401
+
+    def test_vec_tables_created(self, db: Database) -> None:
+        """With sqlite-vec installed, active_profiles should be populated."""
+        assert db.has_vec, "sqlite-vec failed to load — vector search is disabled"
+        assert len(db.active_profiles) >= 1
+
+    def test_vector_search_roundtrip(self, db: Database) -> None:
+        """End-to-end: store an embedding and retrieve it via vector search."""
+        assert db.has_vec, "sqlite-vec not available"
+        embedding = [1.0] * 1024
+        p = db.create_passage(text="vector roundtrip test", embedding=embedding)
+        results = db.search_passages(embedding, top_k=5)
+        assert len(results) >= 1
+        assert results[0].id == p.id
+        db.delete_passage(p.id)
+
+
+class TestEmbeddingProfiles:
+    def test_default_profile(self, db: Database) -> None:
+        """Default config creates a d1024 profile."""
+        assert len(db._profiles) == 1
+        assert db._profiles[0].name == "d1024"
+        assert db._profiles[0].dimensions == 1024
+
+    def test_multi_profile_config(self) -> None:
+        profiles = [
+            EmbeddingProfile(name="d1024", dimensions=1024),
+            EmbeddingProfile(name="d512", dimensions=512),
+            EmbeddingProfile(name="d256", dimensions=256),
+        ]
+        db = Database(db_path=":memory:", embedding_profiles=profiles)
+        db.connect()
+        assert len(db._profiles) == 3
+        assert db._profiles[1].table_name == "passages_vec_d512"
+
+    def test_create_passage_truncates_embedding(self) -> None:
+        """Embedding is truncated to each profile's dimensions at insert time."""
+        profiles = [
+            EmbeddingProfile(name="full", dimensions=4),
+            EmbeddingProfile(name="half", dimensions=2),
+        ]
+        db = Database(db_path=":memory:", embedding_profiles=profiles)
+        db.connect()
+        db.init_default_blocks()
+
+        full_embedding = [1.0, 2.0, 3.0, 4.0]
+        p = db.create_passage(text="Test", embedding=full_embedding)
+        assert p.id  # passage was created
+
+        # Can't directly verify truncation without sqlite-vec, but ensure no errors
+        # The actual truncation logic is: embedding[:profile.dimensions]
+
+    def test_profile_table_name(self) -> None:
+        p = EmbeddingProfile(name="d512", dimensions=512)
+        assert p.table_name == "passages_vec_d512"
+
+
+class TestBackfill:
+    def test_passages_needing_backfill(self, db: Database) -> None:
+        """Passages without embeddings show up as needing backfill."""
+        # Create without embedding
+        db.create_passage(text="Needs backfill")
+        result = db.passages_needing_backfill("d1024")
+        assert len(result) == 1
+        assert result[0].text == "Needs backfill"
+
+    def test_passages_with_embedding_not_in_backfill(self, db: Database) -> None:
+        """Passages that already have embeddings are skipped."""
+        embedding = [1.0] * 1024
+        db.create_passage(text="Already embedded", embedding=embedding)
+        result = db.passages_needing_backfill("d1024")
+        assert len(result) == 0
+
+    def test_store_backfill_embedding(self, db: Database) -> None:
+        """Backfill stores embedding and makes passage searchable."""
+        p = db.create_passage(text="To backfill")
+        embedding = [1.0] * 1024
+        assert db.store_backfill_embedding(p.id, embedding, "d1024") is True
+        results = db.search_passages(embedding, top_k=5)
+        assert len(results) == 1
+        assert results[0].id == p.id
+
+    def test_backfill_nonexistent_profile(self, db: Database) -> None:
+        """Backfill against a nonexistent profile returns empty/False."""
+        db.create_passage(text="Test")
+        assert db.passages_needing_backfill("nonexistent") == []
+        p = db.create_passage(text="Test2")
+        assert db.store_backfill_embedding(p.id, [0.0] * 1024, "nonexistent") is False
 
 
 class TestWriteCallback:

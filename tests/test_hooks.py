@@ -22,11 +22,12 @@ from yaucca.hooks import (
 )
 
 
-def _mock_cloud_settings(url: str = "http://localhost:8283", auth_token: str | None = None):  # type: ignore[no-untyped-def]
+def _mock_cloud_settings(url: str = "http://localhost:8283", auth_token: str | None = None, required: bool = False):  # type: ignore[no-untyped-def]
     """Create mock settings for cloud API."""
     mock = MagicMock()
     mock.cloud.url = url
     mock.cloud.auth_token = auth_token
+    mock.cloud.required = required
     mock.summary = MagicMock()
     mock.summary.enabled = True
     mock.summary.min_exchanges = 3
@@ -70,14 +71,27 @@ class TestSessionStart:
             assert "<memory_metadata>" in output
             assert "<conversation_history>" in output
 
-    def test_cloud_unreachable(self, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_cloud_unreachable_optional(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """When YAUCCA_REQUIRED is false (default), cloud failure degrades silently."""
         with (
             patch("yaucca.hooks._cloud_client", side_effect=Exception("Connection refused")),
+            patch("yaucca.hooks.get_settings", return_value=_mock_cloud_settings(required=False)),
             patch.dict("os.environ", {}, clear=False),
         ):
             session_start({"source": "startup"})
             output = capsys.readouterr().out
             assert output == ""
+
+    def test_cloud_unreachable_required(self) -> None:
+        """When YAUCCA_REQUIRED is true, cloud failure exits non-zero."""
+        with (
+            patch("yaucca.hooks._cloud_client", side_effect=Exception("Connection refused")),
+            patch("yaucca.hooks.get_settings", return_value=_mock_cloud_settings(required=True)),
+            patch.dict("os.environ", {}, clear=False),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            session_start({"source": "startup"})
+        assert exc_info.value.code == 1
 
     def test_skips_when_yaucca_skip_hooks_set(self, capsys: pytest.CaptureFixture[str]) -> None:
         with patch.dict("os.environ", {"YAUCCA_SKIP_HOOKS": "1"}):
@@ -330,7 +344,8 @@ class TestStop:
         ):
             stop({"stop_hook_active": False, "transcript_path": ""})
 
-    def test_cloud_failure_logs_error(self, tmp_path: Path) -> None:
+    def test_cloud_failure_logs_error_optional(self, tmp_path: Path) -> None:
+        """When YAUCCA_REQUIRED is false, cloud failure logs error and returns."""
         transcript_path = _make_transcript(turns=2)
         mock_client = MagicMock()
         mock_client.get.side_effect = Exception("Connection refused")
@@ -342,7 +357,7 @@ class TestStop:
             patch("yaucca.hooks.logger") as mock_logger,
             patch.dict("os.environ", {}, clear=False),
         ):
-            mock_settings.return_value = _mock_cloud_settings()
+            mock_settings.return_value = _mock_cloud_settings(required=False)
 
             stop({
                 "session_id": "sess-1",
@@ -353,4 +368,29 @@ class TestStop:
 
             mock_logger.error.assert_called_once()
 
+        Path(transcript_path).unlink()
+
+    def test_cloud_failure_exits_when_required(self, tmp_path: Path) -> None:
+        """When YAUCCA_REQUIRED is true, cloud failure exits non-zero."""
+        transcript_path = _make_transcript(turns=2)
+        mock_client = MagicMock()
+        mock_client.get.side_effect = Exception("Connection refused")
+
+        with (
+            patch("yaucca.hooks._cloud_client", return_value=(mock_client, "http://localhost:8283")),
+            patch("yaucca.hooks.get_settings") as mock_settings,
+            patch("yaucca.hooks.SESSIONS_DIR", tmp_path),
+            patch.dict("os.environ", {}, clear=False),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            mock_settings.return_value = _mock_cloud_settings(required=True)
+
+            stop({
+                "session_id": "sess-1",
+                "transcript_path": transcript_path,
+                "cwd": "/home/user/project",
+                "stop_hook_active": False,
+            })
+
+        assert exc_info.value.code == 1
         Path(transcript_path).unlink()

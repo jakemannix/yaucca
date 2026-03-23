@@ -23,7 +23,7 @@ class TestCloudConfig:
     def test_defaults(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
             config = CloudConfig(_env_file=None)
-            assert config.url == "http://localhost:8283"
+            assert config.url == "http://YAUCCA_URL_env_var_is_unset:0"
             assert config.auth_token is None
 
     def test_env_override(self) -> None:

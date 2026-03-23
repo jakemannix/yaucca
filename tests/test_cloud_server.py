@@ -98,15 +98,39 @@ class TestPassageEndpoints:
         resp = client.delete("/api/passages/nonexistent")
         assert resp.status_code == 404
 
-    def test_search_passages_fallback(self, client: TestClient) -> None:
-        """Without sqlite-vec, search falls back to text search."""
+    def test_search_passages(self, client: TestClient) -> None:
+        """Search endpoint returns 200. With async embedding queue,
+        newly created passages may not be immediately searchable via vector
+        search, but the endpoint should not error."""
         client.post("/api/passages", json={"text": "Fixed authentication bug"})
         client.post("/api/passages", json={"text": "Updated README"})
         resp = client.get("/api/passages/search", params={"q": "authentication"})
         assert resp.status_code == 200
+
+    def test_search_passages_text_fallback(self, client: TestClient) -> None:
+        """Text search via list endpoint still works for immediate queries."""
+        client.post("/api/passages", json={"text": "Fixed authentication bug"})
+        client.post("/api/passages", json={"text": "Updated README"})
+        resp = client.get("/api/passages", params={"search": "authentication"})
+        assert resp.status_code == 200
         results = resp.json()
         assert len(results) == 1
         assert "authentication" in results[0]["text"]
+
+
+class TestBackfillEndpoint:
+    def test_backfill_all(self, client: TestClient) -> None:
+        """Backfill endpoint runs without error (stub embedder, no sqlite-vec)."""
+        client.post("/api/passages", json={"text": "Passage one"})
+        client.post("/api/passages", json={"text": "Passage two"})
+        resp = client.post("/api/admin/backfill")
+        assert resp.status_code == 200
+
+    def test_backfill_specific_profile(self, client: TestClient) -> None:
+        """Backfill a specific profile name."""
+        client.post("/api/passages", json={"text": "Test"})
+        resp = client.post("/api/admin/backfill", params={"profile": "d1024"})
+        assert resp.status_code == 200
 
 
 class TestAuth:
