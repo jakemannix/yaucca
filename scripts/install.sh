@@ -93,7 +93,7 @@ settings['hooks']['SessionStart'].append({
     }]
 })
 
-# Stop hook
+# Stop hook (Layer 1 only: raw turn persistence, no LLM calls)
 settings['hooks']['Stop'] = settings['hooks'].get('Stop', [])
 settings['hooks']['Stop'] = [
     h for h in settings['hooks']['Stop']
@@ -103,6 +103,20 @@ settings['hooks']['Stop'].append({
     'hooks': [{
         'type': 'command',
         'command': f'cd {repo_dir} && uv run python -m yaucca.hooks stop',
+        'timeout': 10
+    }]
+})
+
+# SessionEnd hook (Layers 2+3: summary + context block update via claude -p)
+settings['hooks']['SessionEnd'] = settings['hooks'].get('SessionEnd', [])
+settings['hooks']['SessionEnd'] = [
+    h for h in settings['hooks']['SessionEnd']
+    if not any('yaucca' in hook.get('command', '') for hook in h.get('hooks', []))
+]
+settings['hooks']['SessionEnd'].append({
+    'hooks': [{
+        'type': 'command',
+        'command': f'cd {repo_dir} && uv run python -m yaucca.hooks session_end',
         'timeout': 120
     }]
 })
@@ -118,7 +132,5 @@ echo ""
 echo "Installation complete!"
 echo ""
 echo "Next steps:"
-echo "  1. Ensure Letta server is running: docker compose up -d"
-echo "  2. Create agent: uv run python -m yaucca.setup_agent"
-echo "  3. Set YAUCCA_AGENT_ID in $REPO_DIR/.env"
-echo "  4. Open a new Claude Code session to test"
+echo "  1. Create .env with YAUCCA_URL and YAUCCA_AUTH_TOKEN"
+echo "  2. Open a new Claude Code session to test"

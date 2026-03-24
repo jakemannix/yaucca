@@ -1,5 +1,14 @@
 # yaucca v2: Cloud-Native Architecture
 
+## Status
+
+**Phase 1: Deployed and tested.** Cloud server running on Modal with all
+Letta data migrated (5 blocks, ~450 passages with Qwen3 embeddings).
+Vector search verified. 98 unit tests passing. Cutover of hooks/MCP
+from Letta to cloud pending user verification.
+
+See `modal-deployment-plan.md` for detailed status and remaining work.
+
 ## Problem Statement
 
 yaucca v1 is tightly coupled to Claude Code on a single laptop:
@@ -25,39 +34,26 @@ next-actions-by-context from his iPhone — without his laptop being open.
    control
 5. **`claude -p` stays on Max**: no API billing changes for summarization
 
-## Key Insight: Claude.ai Custom Connectors
-
-Claude.ai supports custom remote MCP servers via Settings > Connectors:
-
-- Add any HTTPS MCP server URL
-- Requires OAuth 2.1 authentication
-- Once added via web, available on mobile automatically
-- Free plan: 1 connector. Pro/Max: multiple.
-
-This means: if yaucca becomes a cloud-hosted remote MCP server with OAuth, it's
-available on every Claude surface — web, mobile, and Claude Code.
-
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    yaucca-cloud                              │
-│                   (Fly.io or similar)                        │
+│                   (Modal.com)                                │
 │                                                             │
-│  ┌──────────────┐  ┌──────────────┐  ┌───────────────────┐ │
-│  │  MCP Server   │  │  HTTP API    │  │  OAuth 2.1 Layer  │ │
-│  │  (HTTP+SSE)   │  │  (internal)  │  │  (PKCE, tokens)   │ │
-│  └──────┬───────┘  └──────┬───────┘  └───────────────────┘ │
-│         │                  │                                 │
-│         └────────┬─────────┘                                │
-│                  │                                           │
-│         ┌───────▼────────┐     ┌──────────────────┐        │
-│         │   Storage Layer │     │  Embedding Layer  │        │
-│         │   (SQLite +     │     │  (API-based, e.g. │        │
-│         │    sqlite-vec)  │     │   OpenAI or local)│        │
-│         └────────────────┘     └──────────────────┘        │
+│  ┌──────────────┐  ┌──────────────┐                        │
+│  │  FastAPI      │  │  Bearer Auth │                        │
+│  │  HTTP API     │  │  Middleware   │                        │
+│  └──────┬───────┘  └──────────────┘                        │
+│         │                                                   │
+│  ┌──────▼──────────┐     ┌──────────────────┐              │
+│  │  Storage Layer   │     │  Embedding Layer  │              │
+│  │  (SQLite +       │     │  (Qwen3-Embed-   │              │
+│  │   sqlite-vec)    │     │   ding-8B via     │              │
+│  │                  │     │  OpenRouter,1024d)│              │
+│  └─────────────────┘     └──────────────────┘              │
 │                                                             │
-│         Persistent volume: /data/yaucca.db                  │
+│  Persistent volume: /data/yaucca.db                         │
 └─────────────────────────────────────────────────────────────┘
          ▲              ▲              ▲
          │              │              │
@@ -66,161 +62,69 @@ available on every Claude surface — web, mobile, and Claude Code.
    │  Code     │  │  (web)    │  │  mobile   │
    │ (laptop)  │  │           │  │  (phone)  │
    │           │  │           │  │           │
-   │ + hooks   │  │ MCP only  │  │ MCP only  │
-   │ + stdio   │  │ (remote)  │  │ (remote)  │
-   │   proxy   │  │           │  │           │
+   │ + hooks   │  │ remote    │  │ remote    │
+   │ + stdio   │  │ MCP       │  │ MCP       │
+   │   MCP     │  │ (Phase 2) │  │ (Phase 2) │
    └──────────┘  └──────────┘  └───────────┘
 ```
 
-### Claude Code (laptop) — dual transport
+### Claude Code (laptop) — hooks + stdio MCP
 
-On the laptop, yaucca runs in **two modes simultaneously**:
+On the laptop, yaucca runs in two modes simultaneously:
 
-1. **Local stdio MCP server** (unchanged from v1) — Claude Code connects to
-   this via `.mcp.json` as today. Fast, no auth overhead.
-2. **Hooks** (unchanged from v1) — SessionStart injects memory, Stop persists
+1. **Local stdio MCP server** (`mcp_server.py`) — Claude Code connects to
+   this via `.mcp.json`. The 6 MCP tools proxy all calls to the cloud HTTP API.
+2. **Hooks** (`hooks.py`) — SessionStart injects memory, Stop persists
    transcripts and generates summaries via `claude -p` (stays on Max billing).
 
-Both the local MCP server and the hooks talk to the **same cloud database**
-(yaucca-cloud) over HTTPS. The local stdio server is a thin proxy that
-forwards to the cloud API — or, simpler, it connects directly to the cloud
-SQLite via the same HTTP API the remote MCP server exposes.
+Both talk to the cloud database over HTTPS.
 
-### Claude.ai / mobile — remote MCP only
+### Claude.ai / mobile — remote MCP (Phase 2, not started)
 
-These surfaces connect to yaucca-cloud as a remote MCP server via OAuth.
-No hooks, no automatic lifecycle — but for quick GTD interactions (capture
-an item, query a list), explicit tool calls are sufficient:
+These surfaces will connect via a remote MCP server with OAuth 2.1
+authentication. No hooks — explicit tool calls only.
 
-- "Add to inbox: pick up hay" → `insert_archival_memory()`
-- "What's on my @Ranch list?" → `search_archival_memory()`
-- "Update my projects block" → `update_memory_block()`
+## Why Modal Over Fly.io
+
+| Concern | Fly.io | Modal |
+|---------|--------|-------|
+| Billing model | Always-on VM (~$3-5/mo) | Per-second, scale-to-zero ($0 when idle) |
+| Persistent storage | Fly Volumes (traditional FS) | Modal Volumes (commit/reload model) |
+| Deployment | Dockerfile + `fly deploy` | Pure Python decorators + `modal deploy` |
+| Infra config | fly.toml, Dockerfile, Procfile | All in Python code — no YAML/Docker |
+| Scaling | Manual machine sizing | Automatic, including to zero |
+
+Modal is ideal for yaucca: single user, low traffic, scale-to-zero means
+near-zero cost, and no Docker/infra files to maintain.
 
 ## Database Schema
 
-Replace Letta with a single SQLite database using sqlite-vec for vector search.
+Single SQLite database using sqlite-vec for vector search.
 
 ```sql
--- Core memory blocks (replaces Letta blocks API)
--- Expect ~5 rows, each up to 10KB of text.
 CREATE TABLE blocks (
-    label       TEXT PRIMARY KEY,   -- "user", "projects", "patterns", etc.
-    description TEXT NOT NULL,      -- one-line description for relevance
+    label       TEXT PRIMARY KEY,
+    description TEXT NOT NULL,
     value       TEXT NOT NULL DEFAULT '',
     char_limit  INTEGER NOT NULL DEFAULT 5000,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Archival passages (replaces Letta archives + passages API)
--- Expect hundreds to low thousands of rows.
 CREATE TABLE passages (
-    id          TEXT PRIMARY KEY,   -- UUID
+    id          TEXT PRIMARY KEY,
     text        TEXT NOT NULL,
-    tags        TEXT DEFAULT '[]',  -- JSON array: ["exchange"], ["summary"]
-    metadata    TEXT DEFAULT '{}',  -- JSON object: session_id, project, etc.
+    tags        TEXT DEFAULT '[]',   -- JSON array: ["exchange"], ["summary"]
+    metadata    TEXT DEFAULT '{}',   -- JSON object: session_id, project, etc.
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Vector index for semantic search (sqlite-vec virtual table)
--- Dimension depends on embedding model choice.
-CREATE VIRTUAL TABLE passages_vec USING vec0(
+CREATE VIRTUAL TABLE passages_vec_d1024 USING vec0(
     id TEXT PRIMARY KEY,
-    embedding FLOAT[384]            -- all-MiniLM-L6-v2 = 384 dims
+    embedding FLOAT[1024]           -- Qwen3-Embedding-8B via OpenRouter
 );
 ```
 
-### Embedding Strategy
-
-Embeddings are generated **server-side** in yaucca-cloud. The client (MCP
-tools, hooks) never touches vectors — same as today with Letta.
-
-**Recommended model**: OpenAI `text-embedding-3-small` (1536 dims, $0.02/1M
-tokens). At yaucca's scale (~100 passages/week), cost is effectively zero.
-
-**Alternative**: `all-MiniLM-L6-v2` running locally in the cloud container
-(384 dims, free, ~50MB model). Avoids any external API dependency.
-
-**Embedding happens on**:
-- `INSERT passage` → embed text, store in `passages_vec`
-- `search(query)` → embed query, `SELECT` from `passages_vec` ORDER BY distance
-
-### Search Implementation
-
-```sql
--- Semantic search: find passages closest to query embedding
-SELECT p.id, p.text, p.tags, p.metadata, p.created_at, v.distance
-FROM passages p
-JOIN passages_vec v ON p.id = v.id
-WHERE v.embedding MATCH ?query_embedding
-  AND k = ?top_k
-ORDER BY v.distance;
-
--- Text fallback (same as Letta's passages.list with search=)
-SELECT * FROM passages
-WHERE text LIKE '%' || ?query || '%'
-ORDER BY created_at DESC
-LIMIT ?limit;
-
--- Tag-filtered listing (for "exchange" vs "summary" filtering)
-SELECT * FROM passages
-WHERE json_each.value = ?tag
-ORDER BY created_at DESC
-LIMIT ?limit;
-```
-
-## MCP Tool Interface
-
-The 6 existing MCP tools remain identical in interface. The implementation
-changes from Letta API calls to SQLite queries:
-
-| Tool | Current (Letta) | v2 (SQLite) |
-|------|----------------|-------------|
-| `get_memory_block(name)` | `blocks.retrieve()` | `SELECT value FROM blocks WHERE label = ?` |
-| `update_memory_block(name, value)` | `blocks.update()` | `UPDATE blocks SET value = ? WHERE label = ?` |
-| `list_memory_blocks()` | `blocks.list()` | `SELECT * FROM blocks` |
-| `search_archival_memory(query)` | `passages.search()` | vec0 similarity search |
-| `insert_archival_memory(text)` | `archives.passages.create()` | `INSERT` + embed |
-| `get_recent_messages(count)` | `passages.list(ascending=False)` | `SELECT ... WHERE tags LIKE '%exchange%' ORDER BY created_at DESC` |
-
-## Hook Changes
-
-### SessionStart hook — minimal changes
-
-Currently reads from Letta API. Change to read from yaucca-cloud HTTP API:
-
-```python
-# Before (v1)
-blocks = client.agents.blocks.list(agent_id=agent_id)
-passages = client.agents.passages.list(agent_id=agent_id, limit=30)
-
-# After (v2)
-blocks = httpx.get(f"{YAUCCA_URL}/api/blocks", headers=auth).json()
-passages = httpx.get(f"{YAUCCA_URL}/api/passages?limit=30&tag=exchange", headers=auth).json()
-```
-
-Output format (XML rendering) stays identical.
-
-### Stop hook — minimal changes
-
-Layer 1 (persist raw turns):
-```python
-# Before: client.archives.passages.create(archive_id, text=turn, tags=["exchange"])
-# After:  httpx.post(f"{YAUCCA_URL}/api/passages", json={"text": turn, "tags": ["exchange"]})
-```
-
-Layer 2 (summarize via `claude -p`): **No change.** Still calls `claude -p`
-locally, still covered by Max billing. Only the final write changes:
-```python
-# Before: client.archives.passages.create(archive_id, text=summary, tags=["summary"])
-# After:  httpx.post(f"{YAUCCA_URL}/api/passages", json={"text": summary, "tags": ["summary"]})
-```
-
-Layer 3 (update context block): Same pattern — HTTP POST instead of Letta API.
-
-## HTTP API (Internal)
-
-The yaucca-cloud server exposes a simple REST API. The MCP server (both local
-stdio proxy and remote HTTP+SSE) calls this API internally.
+## HTTP API
 
 ```
 GET    /api/blocks              → list all blocks
@@ -233,138 +137,72 @@ GET    /api/passages/search?q=  → semantic vector search (?q=, ?top_k=)
 GET    /health                  → health check
 ```
 
-## OAuth 2.1 Layer
+Bearer token auth on all routes except `/health`.
 
-Required for Claude.ai custom connector registration.
+## MCP Tool Interface
 
-**Recommended approach**: Use an OAuth proxy like Cloudflare Access or Auth0
-in front of yaucca-cloud, rather than implementing OAuth from scratch. This
-gives us:
+The 7 MCP tools are served via the remote MCP server (`cloud/mcp_remote.py`)
+with OAuth 2.1 + GitHub authentication. Tools call the database directly:
 
-- PKCE support
-- Token management
-- `.well-known/oauth-authorization-server` metadata
-- User management (just Jake, but the spec requires it)
+| Tool | Description |
+|------|-------------|
+| `get_memory_block(name)` | Read a core memory block |
+| `update_memory_block(name, value)` | Replace a core memory block |
+| `list_memory_blocks()` | List all blocks with sizes |
+| `search_archival_memory(query, count, max_chars)` | Semantic vector search with truncation |
+| `get_passages(ids, max_chars, offset)` | Fetch full text of specific passages |
+| `insert_archival_memory(text)` | Store a new archival entry |
+| `get_recent_messages(count)` | Recent conversation exchanges |
 
-**Alternative**: Implement minimal OAuth 2.1 directly in the server using
-a library like `authlib` (Python). More control, more code (~200 lines).
-
-**Simplest viable auth for single-user**: The MCP spec requires OAuth 2.1,
-but for a single-user self-hosted server, the practical implementation is:
-
-1. Server generates a long-lived token at setup time
-2. OAuth flow returns this token (satisfying the protocol)
-3. All requests validated against this token
-4. Token rotatable via CLI command
-
-This is technically spec-compliant (OAuth with a pre-authorized grant) while
-being trivial to implement and maintain.
-
-## Deployment
-
-### Recommended: Fly.io
-
-- **App**: Python (FastAPI or Starlette) + sqlite-vec
-- **Persistent volume**: 1GB for SQLite database (generous for text + vectors)
-- **Machine**: `shared-cpu-1x`, 256MB RAM — more than enough
-- **Cost**: ~$3-5/month (smallest Fly machine + volume)
-- **Domain**: `yaucca.fly.dev` or custom domain with TLS
-
-### Setup steps
-
-```bash
-# 1. Create Fly app
-fly launch --name yaucca --region sea  # Seattle, close to Jake
-
-# 2. Create persistent volume
-fly volumes create yaucca_data --size 1 --region sea
-
-# 3. Set secrets
-fly secrets set YAUCCA_AUTH_TOKEN=<generated-token>
-fly secrets set OPENAI_API_KEY=<for-embeddings>  # if using OpenAI embeddings
-
-# 4. Deploy
-fly deploy
-
-# 5. Register with Claude.ai
-# Settings > Connectors > Add Custom Connector
-# URL: https://yaucca.fly.dev/mcp
-# Configure OAuth in Advanced settings
-```
-
-### Local development
-
-```bash
-# Run cloud server locally for testing
-uvicorn yaucca.cloud.server:app --port 8283
-
-# Run MCP server in stdio mode (unchanged)
-uv run python -m yaucca.mcp_server
-
-# Run hooks (unchanged, but YAUCCA_URL points to localhost)
-YAUCCA_URL=http://localhost:8283 uv run python -m yaucca.hooks session_start
-```
-
-## Migration Path
-
-### Phase 1: Cloud database, local everything else
-
-1. Build the SQLite + sqlite-vec storage layer
-2. Build the HTTP API server
-3. Deploy to Fly.io
-4. Point local hooks + MCP server at cloud URL instead of Letta
-5. Verify everything works identically to v1
-6. Docker container (Letta) no longer needed
-
-### Phase 2: Remote MCP server
-
-1. Add HTTP+SSE MCP transport to the cloud server
-2. Add OAuth 2.1 layer
-3. Register as Claude.ai custom connector
-4. Verify access from Claude.ai web and mobile
-
-### Phase 3: GTD system
-
-1. Design GTD-specific memory block structure (contexts, projects, next actions)
-2. Add GTD-aware tools (or use existing tools with GTD conventions)
-3. Configure Claude.ai project instructions for GTD behavior
-4. Set up Discord as a fallback capture channel (optional)
-
-## File Structure (Proposed)
+## File Structure
 
 ```
 src/yaucca/
-  # Existing (unchanged interface, updated internals)
-  mcp_server.py          # stdio MCP server — calls cloud API instead of Letta
-  hooks.py               # SessionStart/Stop — calls cloud API instead of Letta
-  prompt.py              # XML rendering (unchanged)
-  config.py              # Updated: YAUCCA_URL replaces LETTA_BASE_URL
+  # Client (installed everywhere via `uv pip install yaucca`)
+  hooks.py               # SessionStart/Stop/SessionEnd — calls cloud HTTP API
+  prompt.py              # XML rendering (unchanged from v1)
+  config.py              # YAUCCA_URL + YAUCCA_AUTH_TOKEN
+  install.py             # Install hooks into ~/.claude/settings.json
 
-  # New: cloud server
+  # Cloud server
   cloud/
-    server.py            # FastAPI/Starlette HTTP server
-    db.py                # SQLite + sqlite-vec operations
-    embed.py             # Embedding generation (OpenAI API or local model)
-    auth.py              # OAuth 2.1 minimal implementation
-    mcp_remote.py        # HTTP+SSE MCP transport handler
+    db.py                # SQLite + sqlite-vec storage layer
+    server.py            # FastAPI HTTP server
+    embed.py             # Embedding generation (OpenAI API or stub)
+    modal_app.py         # Modal deployment definition
     migrate.py           # One-time Letta → SQLite migration script
-
-  # Removed
-  letta_utils.py         # No longer needed
-  setup_agent.py         # Replaced by DB init in cloud/db.py
 ```
 
-## What We Lose
+## Modal Container Lifecycle
 
-- **Letta ecosystem**: no future Letta features, no shared server with other
-  agents (Nameless would need its own solution if it uses Letta)
-- **Letta's embedding infrastructure**: we manage our own embeddings now
+```python
+@app.function(
+    volumes={"/data": volume},
+    scaledown_window=300,         # 5 min idle before shutdown
+    secrets=[modal.Secret.from_name("yaucca-secrets")],
+)
+@modal.concurrent(max_inputs=10)  # one container, many async requests
+@modal.asgi_app()
+def serve():
+    return create_app(db_path="/data/yaucca.db", on_write=volume.commit)
+```
+
+- **Cold start**: Container spins up, opens SQLite from volume, serves requests
+- **Warm**: Handles requests with in-memory SQLite connection
+- **Idle**: After `scaledown_window` seconds, container shuts down
+- **Volume sync**: `volume.commit()` after every write operation
+
+## What We Lose (vs Letta)
+
+- Letta ecosystem and future Letta features
+- Shared Letta server with other agents (Nameless would need its own solution)
+- Letta's embedding infrastructure — we manage our own
 
 ## What We Gain
 
-- **Phone access**: full GTD from Claude mobile app
-- **No Docker dependency**: SQLite is embedded, no container to manage
-- **Full control**: we own the storage layer, schema, and embedding strategy
-- **Simpler deployment**: single Python process + SQLite file
-- **Cost**: ~$3-5/month (Fly.io) + ~$0 for embeddings at our scale
-- **Faster**: SQLite is faster than Letta's HTTP API for our access patterns
+- Phone access via Claude mobile (Phase 2)
+- No Docker dependency — SQLite is embedded
+- Full control over storage layer, schema, and embedding strategy
+- Simpler deployment — single Python process + SQLite file
+- Cost: ~$0-1/month (Modal scale-to-zero) vs ~$3-5/month (Fly.io always-on)
+- Faster: SQLite is faster than Letta's HTTP API for our access patterns

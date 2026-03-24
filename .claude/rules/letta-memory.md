@@ -1,6 +1,6 @@
-# Letta Memory System
+# yaucca Memory System
 
-You have persistent long-term memory powered by Letta. Your memory survives across sessions, projects, and context compactions.
+You have persistent long-term memory powered by yaucca (cloud SQLite + sqlite-vec on Modal). Your memory survives across sessions, projects, and context compactions.
 
 ## Three-Tier Memory Model
 

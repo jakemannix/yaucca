@@ -47,10 +47,10 @@ class TestRenderMemoryBlocks:
         assert "Nameless agent" in result
 
     def test_extra_blocks_appended(self) -> None:
-        from tests.conftest import make_block_response
+        from tests.conftest import make_block
 
         blocks = make_coding_block_set()
-        blocks.append(make_block_response(label="custom", value="Custom block"))
+        blocks.append(make_block(label="custom", value="Custom block"))
         result = render_memory_blocks(blocks)
 
         assert "<custom>" in result

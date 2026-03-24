@@ -1,22 +1,22 @@
 """Claude Code hook scripts for yaucca's stateful lifecycle.
 
-Two subcommands:
+Three subcommands:
 
   session_start — Fired on SessionStart (startup, resume, compact, clear).
-                  Queries Letta for memory blocks + recent tagged passages,
+                  Queries yaucca cloud for memory blocks + recent tagged passages,
                   renders XML context, and outputs to stdout as additionalContext.
 
   stop          — Fired on Stop (after each assistant turn completes).
-                  Three-layer persistence:
-                    Layer 1: Persists raw turns as individual archival passages
-                             tagged "exchange" (always runs).
-                    Layer 2: When summarization threshold is met, generates an
-                             LLM summary via `claude -p` and persists it tagged
-                             "summary" (non-catastrophic if it fails).
-                    Layer 3: Updates the 'context' memory block via `claude -p`
-                             so the next session starts oriented on recent work.
+                  Layer 1 only: persists raw turns as individual archival passages
+                  tagged "exchange". Cheap HTTP POSTs, no LLM calls.
 
-Both use the synchronous Letta client (short-lived scripts, no async benefit).
+  session_end   — Fired on SessionEnd (when the session actually closes).
+                  Forks a detached background worker (survives Claude Code exit)
+                  that runs Layers 2+3: a single `claude -p` call generates both
+                  an archival summary and a compact context block update.
+                  Logs to ~/.yaucca/session_end.log.
+
+All use httpx to call the yaucca cloud HTTP API.
 All diagnostic logging goes to stderr so stdout stays clean for Claude Code.
 """
 
@@ -27,14 +27,14 @@ import os
 import shutil
 import subprocess
 import sys
-import warnings
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from yaucca.config import SummarizationConfig, get_settings
-from yaucca.letta_utils import extract_archive_id, resolve_archive_id_from_list
 from yaucca.prompt import RECALL_PASSAGE_LIMIT, render_full_context
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="yaucca: %(message)s")
@@ -70,18 +70,21 @@ class SessionState:
     last_summary_passage_id: str = ""
 
 
-# --- Letta client ---
+# --- Cloud API client ---
 
 
-def _get_letta_client() -> Any:
-    """Create a synchronous Letta client from settings."""
-    from letta_client import Letta
+def _cloud_client() -> tuple[httpx.Client, str]:
+    """Create an httpx client configured for the yaucca cloud API.
 
+    Returns (client, base_url).
+    """
     settings = get_settings()
-    kwargs: dict[str, Any] = {"base_url": settings.letta.base_url}
-    if settings.letta.api_key:
-        kwargs["token"] = settings.letta.api_key
-    return Letta(**kwargs)
+    base_url = settings.cloud.url
+    headers: dict[str, str] = {}
+    if settings.cloud.auth_token:
+        headers["Authorization"] = f"Bearer {settings.cloud.auth_token}"
+    client = httpx.Client(base_url=base_url, headers=headers, timeout=15.0)
+    return client, base_url
 
 
 def _read_stdin_json() -> dict[str, Any]:
@@ -271,22 +274,41 @@ def _build_summary_prompt(
     session_id: str,
     max_chars: int,
 ) -> str:
-    """Build the prompt for claude -p to summarize a session."""
+    """Build the prompt for claude -p to summarize a session and generate a context block.
+
+    Returns a prompt that asks for JSON with two fields:
+      - summary: archival session summary (~500 words)
+      - context: compact orientation block for next session (3-8 lines)
+    """
+    now = datetime.now(UTC).strftime("%Y-%m-%d")
     transcript = _format_transcript_for_summary(turns, max_chars)
-    return f"""Summarize this Claude Code session concisely for future reference.
+    return f"""Analyze this Claude Code session and produce TWO outputs as a JSON object.
 
 Project: {project_name}
 Working directory: {cwd}
 Session ID: {session_id}
 Turns: {len(turns)}
 
-Focus on:
-1. What the user wanted to accomplish (goals)
-2. What was actually done (work completed)
-3. Key decisions made and their rationale
-4. Any unfinished work or next steps
+Return a JSON object with exactly two keys:
 
-Keep it under 500 words. Use bullet points. Start with a one-line summary.
+1. "summary" — A concise session summary for archival memory. Focus on:
+   - What the user wanted to accomplish (goals)
+   - What was actually done (work completed)
+   - Key decisions made and their rationale
+   - Any unfinished work or next steps
+   Keep under 500 words. Use bullet points. Start with a one-line summary.
+
+2. "context" — A compact orientation block (3-8 lines) loaded at the START of the
+   next conversation. Use this exact format:
+   Session: {now}. <one-line description of what repo/project was active>
+
+   ## Previous session recap
+   - <2-4 bullet points of what was accomplished>
+
+   ## Current state
+   - <1-2 bullets: what's in progress, what's next, any blockers>
+
+Output ONLY valid JSON — no markdown fences, no preamble, no explanation.
 
 --- Transcript ---
 {transcript}"""
@@ -309,7 +331,7 @@ def _summarize_with_claude(prompt: str, summary_config: SummarizationConfig) -> 
     # Build clean env: strip CLAUDECODE* and CLAUDE_CODE_ENTRYPOINT to prevent
     # claude from refusing to start inside another session, and set
     # YAUCCA_SKIP_HOOKS=1 to prevent recursion (stop hook) and skip SessionStart
-    # (sub-agent doesn't need Letta context).
+    # (sub-agent doesn't need memory context).
     env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDECODE") and k != "CLAUDE_CODE_ENTRYPOINT"}
     env["YAUCCA_SKIP_HOOKS"] = "1"
 
@@ -331,7 +353,7 @@ def _summarize_with_claude(prompt: str, summary_config: SummarizationConfig) -> 
         logger.warning("claude -p timed out after %ds", summary_config.timeout)
         return None
     except Exception as e:
-        logger.debug("claude -p failed: %s", e)
+        logger.warning("claude -p failed: %s", e)
         return None
 
 
@@ -346,133 +368,65 @@ def _should_summarize(new_turn_count: int, new_chars: int, min_exchanges: int, m
     return new_turn_count >= min_exchanges or new_chars >= min_chars
 
 
-# --- Context block update ---
+def _parse_summary_response(raw: str) -> tuple[str | None, str | None]:
+    """Parse the combined JSON response from claude -p into (summary, context).
 
-
-def _build_context_update_prompt(
-    turns: list[Turn],
-    project_name: str,
-    cwd: str,
-    summary: str | None,
-    max_chars: int,
-) -> str:
-    """Build a prompt for claude -p to generate a context block update.
-
-    If a session summary is available, uses that as primary input (cheaper/faster).
-    Otherwise falls back to the raw transcript.
+    Handles both clean JSON and JSON wrapped in markdown fences.
+    Returns (summary, context) — either may be None if parsing fails.
     """
-    now = datetime.now(UTC).strftime("%Y-%m-%d")
-
-    if summary:
-        source_text = f"--- Session Summary ---\n{summary}"
-    else:
-        source_text = f"--- Transcript ---\n{_format_transcript_for_summary(turns, max_chars)}"
-
-    return f"""Generate a concise "context" memory block for a Claude Code agent's persistent memory.
-
-This block is loaded at the START of the next conversation to orient the agent on what was
-recently worked on. It should be 3-8 lines max. Use this exact format:
-
-Session: {now}. <one-line description of what repo/project was active>
-
-## Previous session recap
-- <2-4 bullet points of what was accomplished>
-
-## Current state
-- <1-2 bullets: what's in progress, what's next, any blockers>
-
-Project: {project_name}
-Working directory: {cwd}
-
-{source_text}
-
-Output ONLY the context block content — no preamble, no markdown fences, no explanation."""
-
-
-def _update_context_block(
-    client: Any,
-    agent_id: str,
-    turns: list[Turn],
-    project_name: str,
-    cwd: str,
-    summary: str | None,
-    summary_config: SummarizationConfig,
-) -> None:
-    """Generate and persist an updated context block via claude -p + Letta.
-
-    Best-effort: logs warnings on failure but never raises.
-    """
-    prompt = _build_context_update_prompt(
-        turns, project_name, cwd, summary, summary_config.max_transcript_chars
-    )
-    context_value = _summarize_with_claude(prompt, summary_config)
-    if not context_value:
-        logger.warning("Context block update failed — claude -p returned nothing")
-        return
+    text = raw.strip()
+    # Strip markdown fences if present
+    if text.startswith("```"):
+        lines = text.split("\n")
+        # Remove first and last lines (```json and ```)
+        lines = [line for line in lines[1:] if not line.strip().startswith("```")]
+        text = "\n".join(lines)
 
     try:
-        client.agents.blocks.update("context", agent_id=agent_id, value=context_value)
-        logger.info("Updated context memory block (%d chars)", len(context_value))
-    except Exception as e:
-        logger.warning("Failed to update context block: %s", e)
+        data = json.loads(text)
+        summary = data.get("summary")
+        context = data.get("context")
+        return (
+            summary if isinstance(summary, str) and summary.strip() else None,
+            context if isinstance(context, str) and context.strip() else None,
+        )
+    except (json.JSONDecodeError, AttributeError):
+        # Fallback: treat entire response as a plain-text summary, no context
+        logger.warning("Failed to parse JSON from claude -p — using raw text as summary")
+        return (text if text else None, None)
 
 
-# --- Archive persistence ---
-
-
-def _resolve_archive_id_sync(client: Any, agent_id: str) -> str | None:
-    """Resolve archive_id using the sync Letta client.
-
-    Tries archives.list(agent_id=...) first (works even with no passages),
-    then falls back to extracting from an existing passage.
-    Lets connection errors propagate to caller.
-    """
-    # Primary: query archives attached to this agent
-    try:
-        archives = client.archives.list(agent_id=agent_id)
-        archive_id = resolve_archive_id_from_list(archives)
-        if archive_id:
-            return archive_id
-    except Exception:
-        pass
-
-    # Fallback: extract from existing passage
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        passages = client.agents.passages.list(agent_id, limit=1)
-    return extract_archive_id(passages)
+# --- Passage persistence ---
 
 
 def _persist_turns(
-    client: Any,
-    archive_id: str,
+    client: httpx.Client,
     turns: list[Turn],
     session_id: str,
     project_name: str,
 ) -> None:
-    """Persist each turn as an individual archival passage tagged for filtering.
-
-    No exception handling — caller is responsible.
-    """
+    """Persist each turn as an individual passage tagged for filtering."""
     for turn in turns:
         text = turn.format()
-        client.archives.passages.create(
-            archive_id,
-            text=text,
-            metadata={"session_id": session_id, "project": project_name},
-            tags=["exchange"],
+        resp = client.post(
+            "/api/passages",
+            json={
+                "text": text,
+                "tags": ["exchange"],
+                "metadata": {"session_id": session_id, "project": project_name},
+            },
         )
+        resp.raise_for_status()
 
 
 def _persist_summary(
-    client: Any,
-    archive_id: str,
+    client: httpx.Client,
     summary: str,
     previous_passage_id: str,
     session_id: str,
     project_name: str,
 ) -> str | None:
-    """Persist an LLM-generated summary to Letta archival, replacing previous if exists.
+    """Persist an LLM-generated summary, replacing previous if exists.
 
     Returns the new passage ID, or None on failure.
     """
@@ -483,29 +437,49 @@ def _persist_summary(
         # Delete previous summary passage for this session if it exists
         if previous_passage_id:
             try:
-                client.archives.passages.delete(archive_id, previous_passage_id)
+                client.delete(f"/api/passages/{previous_passage_id}")
             except Exception as e:
                 logger.debug("Failed to delete previous passage %s: %s", previous_passage_id, e)
 
-        result = client.archives.passages.create(
-            archive_id,
-            text=text,
-            metadata={"session_id": session_id, "project": project_name},
-            tags=["summary"],
+        resp = client.post(
+            "/api/passages",
+            json={
+                "text": text,
+                "tags": ["summary"],
+                "metadata": {"session_id": session_id, "project": project_name},
+            },
         )
-
-        # Extract passage ID from result
-        if hasattr(result, "id"):
-            passage_id: str = result.id
-            return passage_id
-        if isinstance(result, list) and result and hasattr(result[0], "id"):
-            passage_id = result[0].id
-            return passage_id
-        return None
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("id")
 
     except Exception as e:
         logger.warning("Failed to persist summary: %s", e)
         return None
+
+
+# --- Passage-like adapter for prompt.py rendering ---
+
+
+class _PassageLike:
+    """Adapter to make cloud API passage dicts work with prompt.py's getattr-based rendering."""
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        self.text = data.get("text", "")
+        self.tags = data.get("tags", [])
+        self.created_at = data.get("created_at", "")
+        self.id = data.get("id", "")
+        self.metadata = data.get("metadata", {})
+
+
+class _BlockLike:
+    """Adapter to make cloud API block dicts work with prompt.py's getattr-based rendering."""
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        self.label = data.get("label", "")
+        self.value = data.get("value", "")
+        self.description = data.get("description", "")
+        self.limit = data.get("limit", 5000)
 
 
 # --- Hook handlers ---
@@ -514,49 +488,43 @@ def _persist_summary(
 def session_start(hook_input: dict[str, Any]) -> None:
     """Handle SessionStart hook: inject memory context into Claude Code.
 
-    Queries Letta for all memory blocks and recent tagged passages, splits
+    Queries yaucca cloud for all memory blocks and recent tagged passages, splits
     them into exchanges and summaries, and renders as XML for additionalContext.
 
-    Gracefully degrades: if Letta is unreachable, outputs nothing and exits 0.
+    When YAUCCA_REQUIRED=true, exits non-zero if cloud is unreachable (failing the
+    Claude Code session). Otherwise, degrades silently.
     """
     if os.environ.get("YAUCCA_SKIP_HOOKS"):
         return
 
     settings = get_settings()
-    agent_id = settings.agent.agent_id
-    if not agent_id:
-        logger.warning("YAUCCA_AGENT_ID not set, skipping memory injection")
-        return
-
+    required = settings.cloud.required
     source = hook_input.get("source", "startup")
-    logger.info("SessionStart (source=%s)", source)
+    logger.info("SessionStart (source=%s, required=%s)", source, required)
 
     try:
-        client = _get_letta_client()
+        client, _ = _cloud_client()
 
         # Fetch memory blocks
-        blocks_page = client.agents.blocks.list(agent_id)
-        blocks = blocks_page.items if hasattr(blocks_page, "items") else blocks_page
+        resp = client.get("/api/blocks")
+        resp.raise_for_status()
+        blocks = [_BlockLike(b) for b in resp.json()]
 
-        # Fetch recent archival passages
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            passages = client.agents.passages.list(
-                agent_id,
-                limit=RECALL_PASSAGE_LIMIT,
-                ascending=False,
-            )
+        # Fetch recent passages
+        resp = client.get("/api/passages", params={"limit": RECALL_PASSAGE_LIMIT, "order": "desc"})
+        resp.raise_for_status()
+        all_passages = [_PassageLike(p) for p in resp.json()]
 
         # Split passages by tag
-        exchanges = [p for p in passages if "exchange" in (getattr(p, "tags", None) or [])]
-        summaries = [p for p in passages if "summary" in (getattr(p, "tags", None) or [])]
-        other = [p for p in passages if p not in exchanges and p not in summaries]
+        exchanges = [p for p in all_passages if "exchange" in p.tags]
+        summaries = [p for p in all_passages if "summary" in p.tags]
+        other = [p for p in all_passages if p not in exchanges and p not in summaries]
 
         context = render_full_context(
-            blocks=list(blocks),
+            blocks=blocks,
             exchanges=exchanges,
             summaries=summaries + other,
-            archival_count=len(passages),
+            archival_count=len(all_passages),
             exchange_count=len(exchanges),
         )
 
@@ -564,36 +532,29 @@ def session_start(hook_input: dict[str, Any]) -> None:
         print(context)
         logger.info(
             "Injected %d blocks, %d exchanges, %d summaries",
-            len(list(blocks)),
+            len(blocks),
             len(exchanges),
             len(summaries + other),
         )
 
     except Exception as e:
-        logger.warning("Failed to load memory from Letta: %s", e)
-        # Graceful degradation: exit 0, no output
+        if required:
+            logger.error("FATAL: Memory unavailable (YAUCCA_REQUIRED=true): %s", e)
+            sys.exit(1)
+        logger.warning("Failed to load memory from yaucca cloud: %s", e)
 
 
 def stop(hook_input: dict[str, Any]) -> None:
-    """Handle Stop hook: persist turns, optionally summarize, and update context.
+    """Handle Stop hook: persist raw turns only (Layer 1).
 
-    Three-layer persistence:
-      Layer 1: Always persist raw turns as tagged archival passages.
-      Layer 2: When threshold is met, generate and persist an LLM summary.
-               If summarization fails, log error — turns are already safe.
-      Layer 3: Always update the 'context' memory block via claude -p so the
-               next session starts with fresh orientation on recent work.
+    Fires after every assistant turn. Persists new exchanges as individual
+    archival passages tagged "exchange". Cheap HTTP POSTs, no LLM calls.
     """
     if os.environ.get("YAUCCA_SKIP_HOOKS"):
         return
 
     # Prevent recursion if a stop hook is already active
     if hook_input.get("stop_hook_active", False):
-        return
-
-    settings = get_settings()
-    agent_id = settings.agent.agent_id
-    if not agent_id:
         return
 
     transcript_path = hook_input.get("transcript_path", "")
@@ -613,7 +574,7 @@ def stop(hook_input: dict[str, Any]) -> None:
     # Load session state
     state = _load_session_state(session_id)
 
-    # Layer 1: Extract new turns since last persistence
+    # Extract new turns since last persistence
     new_turns, new_chars, total_lines = _extract_turns(
         transcript_path, start_line=state.last_persisted_line_offset
     )
@@ -622,22 +583,27 @@ def stop(hook_input: dict[str, Any]) -> None:
         logger.debug("No new turns since last persistence")
         return
 
-    # Connect to Letta — fail-fast on connection errors
+    required = get_settings().cloud.required
+
+    # Connect to cloud API
     try:
-        client = _get_letta_client()
-        archive_id = _resolve_archive_id_sync(client, agent_id)
+        client, _ = _cloud_client()
+        # Quick health check
+        client.get("/health").raise_for_status()
     except Exception as e:
-        logger.error("Failed to connect to Letta: %s", e)
+        if required:
+            logger.error("FATAL: Cannot persist turns (YAUCCA_REQUIRED=true): %s", e)
+            sys.exit(1)
+        logger.error("Failed to connect to yaucca cloud: %s", e)
         return
 
-    if not archive_id:
-        logger.error("Could not resolve archive_id for agent %s", agent_id)
-        return
-
-    # Layer 1: Persist raw turns
+    # Persist raw turns
     try:
-        _persist_turns(client, archive_id, new_turns, session_id, project_name)
+        _persist_turns(client, new_turns, session_id, project_name)
     except Exception as e:
+        if required:
+            logger.error("FATAL: Turn persistence failed (YAUCCA_REQUIRED=true): %s", e)
+            sys.exit(1)
         logger.error("Failed to persist turns: %s", e)
         return
 
@@ -645,96 +611,175 @@ def stop(hook_input: dict[str, Any]) -> None:
     state.last_persisted_line_offset = total_lines
     logger.info("Persisted %d raw turns to archival memory", len(new_turns))
 
-    # Layer 2: Check if we should do full summarization
-    summary: str | None = None
-    all_turns: list[Turn] = []
-    summary_config = settings.summary
-
-    # Extract turns since last summary for threshold check
-    turns_since_summary, chars_since_summary, _ = _extract_turns(
-        transcript_path, start_line=state.last_summary_line_offset
-    )
-
-    if summary_config.enabled and _should_summarize(
-        len(turns_since_summary), chars_since_summary, summary_config.min_exchanges, summary_config.min_chars
-    ):
-        # Extract ALL turns from start for full-session summary
-        all_turns, _, _ = _extract_turns(transcript_path, start_line=0)
-
-        if all_turns:
-            prompt = _build_summary_prompt(
-                all_turns, project_name, cwd, session_id, summary_config.max_transcript_chars
-            )
-            summary = _summarize_with_claude(prompt, summary_config)
-
-            if summary:
-                passage_id = _persist_summary(
-                    client,
-                    archive_id,
-                    summary,
-                    state.last_summary_passage_id,
-                    session_id,
-                    project_name,
-                )
-
-                state.last_summary_ts = datetime.now(UTC).isoformat()
-                state.last_summary_exchange_count = len(all_turns)
-                state.last_summary_line_offset = total_lines
-                if passage_id:
-                    state.last_summary_passage_id = passage_id
-
-                logger.info("Persisted LLM-generated session summary (%d turns)", len(all_turns))
-            else:
-                logger.error("Summarization failed — raw turns already persisted")
-
-    # Layer 3: Update the context memory block so the next session starts oriented.
-    # Uses the summary if one was just generated, otherwise falls back to raw turns.
-    # Reuse all_turns from Layer 2 if available, otherwise extract fresh.
-    if not all_turns:
-        all_turns, _, _ = _extract_turns(transcript_path, start_line=0)
-    if all_turns:
-        _update_context_block(
-            client,
-            agent_id,
-            all_turns,
-            project_name,
-            cwd,
-            summary,
-            summary_config,
-        )
-
-    # Save session state (always, even if summarization was skipped/failed)
+    # Save session state
     _save_session_state(state)
 
 
-def status() -> None:
-    """Show recent Letta passages and session state — for manual verification."""
+def _session_end_worker(
+    transcript_path: str,
+    session_id: str,
+    project_name: str,
+    cwd: str,
+) -> None:
+    """Background worker for session summarization (Layers 2+3).
+
+    Runs in a detached subprocess so it survives Claude Code's session exit.
+    Reads the transcript, calls claude -p, and persists summary + context block.
+    """
     settings = get_settings()
-    agent_id = settings.agent.agent_id
-    if not agent_id:
-        print("YAUCCA_AGENT_ID not set")
+    summary_config = settings.summary
+
+    # Extract all turns for full-session summary
+    all_turns, _, total_lines = _extract_turns(transcript_path, start_line=0)
+    if not all_turns:
+        logger.debug("No turns to summarize")
         return
 
-    # Show recent passages
+    # Check minimum threshold — skip summarization for trivially short sessions
+    if not _should_summarize(
+        len(all_turns), sum(len(t.format()) for t in all_turns),
+        summary_config.min_exchanges, summary_config.min_chars,
+    ):
+        logger.info("Session too short for summarization (%d turns)", len(all_turns))
+        return
+
+    # Connect to cloud API
     try:
-        client = _get_letta_client()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            passages = client.agents.passages.list(agent_id, limit=20, ascending=False)
+        client, _ = _cloud_client()
+        client.get("/health").raise_for_status()
     except Exception as e:
-        print(f"Failed to connect to Letta: {e}")
+        logger.error("Failed to connect to yaucca cloud: %s", e)
         return
 
-    print(f"Agent: {agent_id}")
+    # Single claude -p call for both summary + context block
+    prompt = _build_summary_prompt(
+        all_turns, project_name, cwd, session_id, summary_config.max_transcript_chars
+    )
+    raw_response = _summarize_with_claude(prompt, summary_config)
+
+    if not raw_response:
+        logger.error("Summarization failed — raw turns were already persisted by Stop hook")
+        return
+
+    summary, context_value = _parse_summary_response(raw_response)
+
+    # Load session state for summary passage tracking
+    state = _load_session_state(session_id)
+
+    # Layer 2: Persist the archival summary
+    if summary:
+        passage_id = _persist_summary(
+            client,
+            summary,
+            state.last_summary_passage_id,
+            session_id,
+            project_name,
+        )
+
+        state.last_summary_ts = datetime.now(UTC).isoformat()
+        state.last_summary_exchange_count = len(all_turns)
+        state.last_summary_line_offset = total_lines
+        if passage_id:
+            state.last_summary_passage_id = passage_id
+
+        logger.info("Persisted LLM-generated session summary (%d turns)", len(all_turns))
+
+    # Layer 3: Update the context memory block
+    if context_value:
+        try:
+            resp = client.put("/api/blocks/context", json={"value": context_value})
+            resp.raise_for_status()
+            logger.info("Updated context memory block (%d chars)", len(context_value))
+        except Exception as e:
+            logger.warning("Failed to update context block: %s", e)
+
+    _save_session_state(state)
+
+
+def session_end(hook_input: dict[str, Any]) -> None:
+    """Handle SessionEnd hook: fork a detached worker for summarization.
+
+    Claude Code's SessionEnd has a very short timeout (~1.5s) that kills hooks
+    quickly. We can't run claude -p inline. Instead, we fork a detached subprocess
+    that runs _session_end_worker and survives the parent's exit.
+    """
+    if os.environ.get("YAUCCA_SKIP_HOOKS"):
+        return
+
+    transcript_path = hook_input.get("transcript_path", "")
+    if not transcript_path or not Path(transcript_path).exists():
+        return
+
+    session_id = hook_input.get("session_id", "unknown")
+    cwd = hook_input.get("cwd", "")
+    project_name = Path(cwd).name if cwd else "unknown"
+
+    settings = get_settings()
+    if not settings.summary.enabled:
+        return
+
+    logger.info("SessionEnd: forking background summarization worker")
+
+    # Fork a detached subprocess that calls _session_end_worker via CLI.
+    # This survives Claude Code's process exit.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDECODE") and k != "CLAUDE_CODE_ENTRYPOINT"}
+    env["YAUCCA_SKIP_HOOKS"] = "1"
+
+    # Use the same Python that's running this hook
+    python = sys.executable
+    worker_script = f"""\
+import sys
+sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})
+from yaucca.hooks import _session_end_worker
+_session_end_worker(
+    transcript_path={transcript_path!r},
+    session_id={session_id!r},
+    project_name={project_name!r},
+    cwd={cwd!r},
+)
+"""
+
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        log_file = open(STATE_DIR / "session_end.log", "a")  # noqa: SIM115
+        subprocess.Popen(
+            [python, "-c", worker_script],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=log_file,
+            start_new_session=True,  # Detach from parent process group
+        )
+        logger.info("Background worker forked successfully")
+    except Exception as e:
+        logger.error("Failed to fork background worker: %s", e)
+
+
+def status() -> None:
+    """Show recent passages and session state — for manual verification."""
+    try:
+        client, base_url = _cloud_client()
+    except Exception as e:
+        print(f"Failed to create cloud client: {e}")
+        return
+
+    try:
+        resp = client.get("/api/passages", params={"limit": 20, "order": "desc"})
+        resp.raise_for_status()
+        passages = resp.json()
+    except Exception as e:
+        print(f"Failed to connect to yaucca cloud at {base_url}: {e}")
+        return
+
+    print(f"Cloud: {base_url}")
     print(f"Passages: {len(passages)} most recent\n")
 
     for p in passages:
-        tags = getattr(p, "tags", []) or []
-        text = getattr(p, "text", "")
+        tags = p.get("tags", [])
+        text = p.get("text", "")
         preview = text[:120].replace("\n", " ")
         if len(text) > 120:
             preview += "..."
-        pid = getattr(p, "id", "?")[:12]
+        pid = p.get("id", "?")[:12]
         print(f"  {pid}  tags={tags}")
         print(f"    {preview}\n")
 
@@ -758,7 +803,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="yaucca-hooks", description="yaucca Claude Code hooks")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("session_start", help="SessionStart hook")
-    subparsers.add_parser("stop", help="Stop hook")
+    subparsers.add_parser("stop", help="Stop hook (Layer 1: persist raw turns)")
+    subparsers.add_parser("session_end", help="SessionEnd hook (Layers 2+3: summarize + update context)")
     subparsers.add_parser("status", help="Show recent passages and session state")
 
     args = parser.parse_args()
@@ -771,6 +817,8 @@ def main() -> None:
             session_start(hook_input)
         elif args.command == "stop":
             stop(hook_input)
+        elif args.command == "session_end":
+            session_end(hook_input)
 
 
 if __name__ == "__main__":
