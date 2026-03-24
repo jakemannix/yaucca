@@ -19,8 +19,10 @@ image = (
         "pydantic>=2.0.0",
         "pydantic-settings>=2.0.0",
         "sqlite-vec>=0.1.0",
+        "mcp>=1.25.0",
+        "sse-starlette>=2.0.0",
     )
-    .add_local_python_source("yaucca")  # v2: added get_passage endpoint
+    .add_local_python_source("yaucca")
 )
 
 
@@ -33,11 +35,16 @@ image = (
 @modal.concurrent(max_inputs=10)
 @modal.asgi_app()
 def serve():
-    """Serve the yaucca FastAPI app with SQLite on a persistent volume."""
-    from yaucca.cloud.server import create_app
+    """Serve the yaucca composite app (REST API + remote MCP) on a persistent volume."""
+    import os
 
-    return create_app(
+    from yaucca.cloud.server import create_composite_app
+
+    issuer_url = os.environ.get("YAUCCA_ISSUER_URL")
+
+    return create_composite_app(
         db_path="/data/yaucca.db",
         on_write=lambda: None,  # Block writes don't need volume commit (low freq)
         commit_fn=volume.commit,  # Embedding queue commits after each batch flush
+        issuer_url=issuer_url,
     )

@@ -79,6 +79,7 @@ def create_app(
     db_path: str = ":memory:",
     on_write: Any = None,
     commit_fn: Callable[[], None] | None = None,
+    on_db_ready: Callable[[], None] | None = None,
 ) -> FastAPI:
     """Create the FastAPI application.
 
@@ -124,6 +125,9 @@ def create_app(
             max_wait_seconds=5.0,
         )
         await _embed_queue.start()
+
+        if on_db_ready:
+            on_db_ready()
 
         logger.info("yaucca cloud server started (db=%s)", db_path)
         yield
@@ -351,5 +355,108 @@ def create_app(
             return {profile: result}
         else:
             return await backfill_all_profiles(db, embedder)
+
+    return app
+
+
+def create_composite_app(
+    db_path: str = ":memory:",
+    on_write: Any = None,
+    commit_fn: Callable[[], None] | None = None,
+    issuer_url: str | None = None,
+) -> FastAPI:
+    """Create composite app with REST API + remote MCP endpoint.
+
+    If issuer_url is provided, mounts the remote MCP server with OAuth at /mcp.
+    The MCP tools call the database directly (same process).
+    """
+    if not issuer_url:
+        return create_app(db_path, on_write, commit_fn)
+
+    import httpx as httpx_oauth
+
+    from yaucca.cloud.mcp_remote import create_remote_mcp
+    from yaucca.cloud.oauth_provider import OAuthStore
+
+    github_client_id = os.environ.get("GITHUB_CLIENT_ID", "")
+    github_client_secret = os.environ.get("GITHUB_CLIENT_SECRET", "")
+    github_allowed_users = os.environ.get("GITHUB_ALLOWED_USERS", "jakemannix").split(",")
+    github_callback_url = f"{issuer_url.rstrip('/')}/oauth/github/callback"
+
+    # OAuth store shares the same SQLite connection as the main DB.
+    oauth_store = OAuthStore(lambda: _get_db().conn)
+
+    # Create the MCP server and get its Starlette app + session manager.
+    mcp = create_remote_mcp(
+        issuer_url, oauth_store,
+        github_client_id=github_client_id,
+        github_callback_url=github_callback_url,
+    )
+    mcp_starlette = mcp.streamable_http_app()
+    session_manager = mcp.session_manager
+    oauth_provider = mcp._yaucca_oauth_provider  # type: ignore[attr-defined]
+
+    app = create_app(db_path, on_write, commit_fn, on_db_ready=oauth_store.init_schema)
+
+    # --- GitHub OAuth callback ---
+
+    @app.get("/oauth/github/callback")
+    async def github_callback(code: str, state: str) -> Any:
+        """Handle GitHub OAuth callback: verify user, complete MCP authorization."""
+        from fastapi.responses import RedirectResponse
+
+        # Exchange GitHub code for access token
+        async with httpx_oauth.AsyncClient() as hc:
+            token_resp = await hc.post(
+                "https://github.com/login/oauth/access_token",
+                json={
+                    "client_id": github_client_id,
+                    "client_secret": github_client_secret,
+                    "code": code,
+                },
+                headers={"Accept": "application/json"},
+            )
+            if token_resp.status_code != 200:
+                raise HTTPException(status_code=502, detail="GitHub token exchange failed")
+            github_token = token_resp.json().get("access_token")
+            if not github_token:
+                raise HTTPException(status_code=400, detail=f"GitHub error: {token_resp.json().get('error_description', 'no token')}")
+
+            # Get GitHub user info
+            user_resp = await hc.get(
+                "https://api.github.com/user",
+                headers={"Authorization": f"Bearer {github_token}", "Accept": "application/json"},
+            )
+            if user_resp.status_code != 200:
+                raise HTTPException(status_code=502, detail="GitHub user info failed")
+            github_username = user_resp.json().get("login", "")
+
+        # Check allowlist
+        if github_username not in github_allowed_users:
+            logger.warning("GitHub user '%s' not in allowed list: %s", github_username, github_allowed_users)
+            raise HTTPException(status_code=403, detail=f"User '{github_username}' is not authorized")
+
+        # Complete the MCP OAuth flow
+        redirect_url = oauth_provider.complete_authorization(state, github_username)
+        if not redirect_url:
+            raise HTTPException(status_code=400, detail="Authorization request expired or invalid")
+
+        logger.info("GitHub user '%s' authorized for MCP access", github_username)
+        return RedirectResponse(url=redirect_url)
+
+    # Wrap the existing lifespan to also run the MCP session manager.
+    _original_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def _composite_lifespan(a: FastAPI):  # type: ignore[no-untyped-def]
+        async with _original_lifespan(a) as state, session_manager.run():
+            logger.info("MCP session manager started")
+            yield state
+
+    app.router.lifespan_context = _composite_lifespan
+
+    # Mount the MCP Starlette app for /mcp and OAuth well-known endpoints.
+    app.mount("/", mcp_starlette)
+    logger.info("Mounted remote MCP server at /mcp (issuer: %s)", issuer_url)
 
     return app
