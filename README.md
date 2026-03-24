@@ -18,14 +18,14 @@ and Claude mobile (phone).
 ```
 ┌──────────────────────────────────────────────────────┐
 │  Modal.com (scale-to-zero, ~$0-1/month)              │
-│                                                       │
-│  FastAPI + SQLite + sqlite-vec + Qwen3 embeddings     │
-│  Remote MCP (OAuth 2.1 + GitHub login)                │
-│  Persistent volume: /data/yaucca.db                   │
-└────────────────┬──────────────────────────────────────┘
-                 │ HTTPS
-    ┌────────────┼────────────┐
-    │            │            │
+│                                                      │
+│  FastAPI + SQLite + sqlite-vec + Qwen3 embeddings    │
+│  Remote MCP (OAuth 2.1 + GitHub login)               │
+│  Persistent volume: /data/yaucca.db                  │
+└───────────────┬──────────────────────────────────────┘
+                │ HTTPS
+    ┌───────────┼───────────┐
+    │           │           │
 ┌───┴────┐ ┌────┴───┐ ┌─────┴────┐
 │ Claude │ │ Claude │ │  Claude  │
 │ Code   │ │  .ai   │ │  mobile  │
