@@ -4,9 +4,14 @@
 Claude Code, deployed as a cloud-native FastAPI server on
 [Modal.com](https://modal.com).
 
+Inspired by [MemGPT/Letta](https://github.com/letta-ai/letta)'s tiered memory
+architecture, but built as a lightweight self-hosted stack: SQLite + sqlite-vec
+on a single Modal container with scale-to-zero billing.
+
 Every Claude Code session starts with full memory context and ends by
 persisting what happened. Memory survives across sessions, projects, and
-context compactions.
+context compactions — accessible from Claude Code (laptop), Claude.ai (web),
+and Claude mobile (phone).
 
 ## Architecture
 
@@ -32,7 +37,15 @@ context compactions.
 └────────┘ └────────┘ └──────────┘
 ```
 
-### Memory Tiers
+### How it works
+
+- **Hooks** (Claude Code only): SessionStart injects memory, Stop persists
+  raw exchanges, SessionEnd generates a summary via `claude -p`
+- **Remote MCP** (all surfaces): 7 tools for reading/writing memory blocks,
+  semantic search over archival passages, and progressive disclosure drill-down
+- **OAuth 2.1**: GitHub login gates access — only allowed users can connect
+
+### Memory tiers
 
 1. **Core Memory** (5 blocks, always loaded): `user`, `projects`, `patterns`,
    `learnings`, `context`
@@ -41,6 +54,14 @@ context compactions.
 3. **Recall Memory** (pre-loaded): Recent conversation history injected at startup
 
 ## Quick Start
+
+### Prerequisites
+
+- Python 3.11+
+- [uv](https://docs.astral.sh/uv/)
+- [Modal](https://modal.com) account (free tier works)
+- [OpenRouter](https://openrouter.ai) API key (for embeddings)
+- [GitHub OAuth App](https://github.com/settings/developers) (for MCP auth)
 
 ### Step 1: Deploy your backend (once, from your laptop)
 
@@ -100,6 +121,16 @@ for the yaucca server. To connect:
 
 The OAuth token is cached and refreshed automatically.
 
+**Claude.ai web / mobile:** Go to Settings → Integrations → Add custom
+integration → paste `https://<your-username>--yaucca-serve.modal.run/mcp`
+→ walk through GitHub OAuth. No hooks on these surfaces, but all 7 MCP tools
+are available.
+
+**Claude Code cloud environments:** Add `uv pip install yaucca` to your
+setup script and set `YAUCCA_URL` + `YAUCCA_AUTH_TOKEN` as environment
+variables. Hooks fire automatically if configured in the repo's
+`.claude/settings.json`.
+
 ### Hook lifecycle
 
 - **SessionStart**: Injects memory context (core blocks + recent exchanges)
@@ -122,145 +153,42 @@ cp ~/.claude/settings.json.bak ~/.claude/settings.json
 The SQLite database on Modal's persistent volume is never modified by
 rollback — your memory is always safe.
 
-### Verify
-
-```bash
-# Test SessionStart hook — should print XML memory context to stdout
-echo '{"source":"startup"}' | python -m yaucca.hooks session_start
-
-# If it prints nothing, check stderr for errors.
-# First run may be slow (~5s) due to Modal cold start.
-
-# Open Claude Code — it should load your memory context
-claude
-```
-
-## Testing the Cutover from Letta
-
-If you're migrating from v1 (Letta-based), follow this process. **Your Letta
-data is untouched throughout — this is a copy, not a move.**
-
-### Step 1: Migrate data
-
-Make sure `.env` has both the cloud config and the Letta config:
-
-```bash
-# .env should contain:
-# YAUCCA_URL=https://<url>.modal.run
-# YAUCCA_AUTH_TOKEN=<token>
-# LETTA_BASE_URL=http://localhost:8283
-# YAUCCA_AGENT_ID=<your-letta-agent-id>
-
-uv run --extra migrate python -m yaucca.cloud.migrate
-```
-
-Safe to re-run — deduplicates by text content.
-
-### Step 2: Verify cloud data
-
-```bash
-# source .env for curl commands
-source .env
-
-# Check blocks
-curl -s $YAUCCA_URL/api/blocks \
-  -H "Authorization: Bearer $YAUCCA_AUTH_TOKEN" | python3 -m json.tool
-
-# Check passage count
-curl -s "$YAUCCA_URL/api/passages?limit=1000" \
-  -H "Authorization: Bearer $YAUCCA_AUTH_TOKEN" | python3 -c \
-  "import json,sys; print(f'{len(json.load(sys.stdin))} passages')"
-
-# Test vector search
-curl -s "$YAUCCA_URL/api/passages/search?q=test+query" \
-  -H "Authorization: Bearer $YAUCCA_AUTH_TOKEN" | python3 -m json.tool
-
-# Health (includes vec status)
-curl -s $YAUCCA_URL/health \
-  -H "Authorization: Bearer $YAUCCA_AUTH_TOKEN" | python3 -m json.tool
-```
-
-### Step 3: Test hooks locally (without changing your live config)
-
-```bash
-cd /path/to/yaucca
-
-# Test SessionStart — should print XML memory from the cloud
-echo '{"source":"startup"}' | uv run python -m yaucca.hooks session_start
-
-# Check passage stats
-uv run python -m yaucca.hooks status
-```
-
-### Step 4: Switch over
-
-```bash
-cd /path/to/yaucca
-uv run python -m yaucca.install
-```
-
-This replaces any existing yaucca hooks with ones pointing at this repo.
-A backup is saved to `~/.claude/settings.json.bak`.
-
-### Step 5: Rollback if something breaks
-
-The old Letta-based system is still intact. To revert:
-
-```bash
-# Option A: uninstall yaucca hooks entirely
-cd /path/to/yaucca
-uv run python -m yaucca.install --uninstall
-
-# Then re-install the old Letta-based hooks from the old repo
-cd /path/to/old/yetanotheruseless_claude_code_agent
-uv run python -m yaucca.install
-
-# Option B: just restore the backup
-cp ~/.claude/settings.json.bak ~/.claude/settings.json
-```
-
-Verify Letta is still running: `curl http://localhost:8283/v1/health`
-
-No data is lost — Letta still has all your original memory. Any new data
-written to the cloud during testing is simply extra; it won't conflict.
-
 ## Configuration
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `YAUCCA_URL` | *(fails fast if unset)* | Cloud server URL |
-| `YAUCCA_AUTH_TOKEN` | *(none)* | Bearer token for cloud API |
+| `YAUCCA_URL` | *(required)* | Your Modal deployment URL |
+| `YAUCCA_AUTH_TOKEN` | *(none)* | Bearer token for the REST API (hooks use this) |
 | `YAUCCA_REQUIRED` | `false` | If `true`, hooks exit non-zero when cloud is unreachable |
-| `YAUCCA_EMBED_BASE_URL` | `https://openrouter.ai/api/v1` | Embedding API base URL |
-| `YAUCCA_EMBED_MODEL` | `qwen/qwen3-embedding-8b` | Embedding model |
-| `YAUCCA_EMBED_DIMS` | `1024` | Embedding dimensions |
+
+Server-side (set in Modal secrets):
+
+| Variable | Default | Description |
+|---|---|---|
+| `OPENROUTER_API_KEY` | *(required)* | For Qwen3-Embedding-8B embeddings |
+| `YAUCCA_ISSUER_URL` | *(required)* | Public URL of your deployment (OAuth issuer) |
+| `GITHUB_CLIENT_ID` | *(required)* | From your GitHub OAuth App |
+| `GITHUB_CLIENT_SECRET` | *(required)* | From your GitHub OAuth App |
+| `GITHUB_ALLOWED_USERS` | *(required)* | Comma-separated GitHub usernames allowed to authorize |
 
 ### Stateful Agent Mode
 
 Set `YAUCCA_REQUIRED=true` when running yaucca as a critical dependency (e.g.
 for a stateful agent that must have memory). In this mode, hooks will fail hard
 (exit 1) if the cloud is unreachable, rather than silently starting without
-memory. A stateful agent without memory is a different, broken thing — not a
-gracefully degraded version of the same thing.
+memory.
 
 ## Embedding Model Comparison
 
 yaucca supports multiple embedding profiles for A/B testing retrieval quality
 across different models or Matryoshka dimension truncations.
 
-### How It Works
-
 Each embedding profile creates a separate `passages_vec_{name}` table in SQLite.
 When a passage is inserted, its embedding is truncated to each profile's
 dimension and stored in every active profile's table. Search can target a
 specific profile via `?profile=` query parameter.
-
-### Side-by-Side Comparison
-
-**1. Configure multiple profiles** in `modal_app.py` (or wherever you create
-the `Database`):
 
 ```python
 from yaucca.cloud.db import Database, EmbeddingProfile
@@ -274,57 +202,12 @@ db = Database(
 )
 ```
 
-New passages will be indexed into both profiles automatically.
-
-**2. Backfill existing data.** If you already have passages stored, the new
-profile's vec table will be empty — you must re-embed all existing passages
-before the comparison is valid. Use the built-in backfill endpoint or CLI:
+Backfill existing passages into new profiles via the admin endpoint:
 
 ```bash
-# Via the server endpoint (re-embeds server-side, batched):
 curl -X POST "$YAUCCA_URL/api/admin/backfill?profile=d512" \
   -H "Authorization: Bearer $YAUCCA_AUTH_TOKEN"
-
-# Or backfill all profiles at once:
-curl -X POST "$YAUCCA_URL/api/admin/backfill" \
-  -H "Authorization: Bearer $YAUCCA_AUTH_TOKEN"
-
-# Or via CLI (calls the endpoint):
-uv run python -m yaucca.cloud.backfill --profile d512
 ```
-
-The backfill embeds in batches of 50 for efficiency. It's idempotent —
-already-indexed passages are skipped.
-
-**3. Compare search results:**
-
-```bash
-# Search with full 1024-dim profile
-curl "$YAUCCA_URL/api/passages/search?q=authentication+bug&profile=d1024"
-
-# Search with 512-dim profile
-curl "$YAUCCA_URL/api/passages/search?q=authentication+bug&profile=d512"
-```
-
-**4. Drop the losing profile** once you've decided:
-
-```python
-db.drop_profile("d512")  # removes the vec table entirely
-```
-
-### Comparing Different Models
-
-To compare two entirely different embedding models (not just Matryoshka
-truncations of the same model):
-
-1. Create a profile with a distinct name and the new model's native dimension
-   (e.g., `EmbeddingProfile("openai_1536", 1536)`)
-2. Update the server's embedder config to the new model
-3. **Fully backfill** that profile — every passage must be embedded with the
-   new model. You cannot mix embeddings from different models in the same
-   vec table; cosine similarity between vectors from different embedding
-   spaces is meaningless
-4. Compare search results, then drop the loser's profile
 
 ## Development
 
