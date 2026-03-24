@@ -53,6 +53,11 @@ migrate = [
 yaucca-install = "yaucca.install:main"
 yaucca-deploy-secrets = "yaucca.deploy_secrets:main"
 
+[project.urls]
+Homepage = "https://github.com/jakemannix/yaucca"
+Repository = "https://github.com/jakemannix/yaucca"
+Issues = "https://github.com/jakemannix/yaucca/issues"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
