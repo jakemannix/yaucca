@@ -102,9 +102,62 @@ file — no inline env vars needed.
 - **Stop** (every turn): Persists raw exchanges to archival — cheap HTTP POSTs, no LLM calls
 - **SessionEnd** (on exit): Single `claude -p` call generates both an archival summary and an updated context block
 
-The `.mcp.json` in the project root is already configured for the MCP
-server. If you need it globally, copy the `yaucca` entry to
-`~/.claude/.mcp.json`.
+### MCP server (two options)
+
+**Option A: Remote MCP (recommended)** — Claude.ai, mobile, and Claude Code
+all connect to the same remote MCP server via OAuth 2.1 + GitHub login:
+
+```json
+// .mcp.json
+{
+  "mcpServers": {
+    "yaucca": {
+      "type": "url",
+      "url": "https://jakemannix--yaucca-serve.modal.run/mcp"
+    }
+  }
+}
+```
+
+On first connect, Claude Code opens a browser for GitHub OAuth. After that,
+the token is cached and refreshed automatically.
+
+**Option B: Stdio proxy (fallback)** — local subprocess proxies to the cloud
+API via HTTP. No OAuth, uses `YAUCCA_AUTH_TOKEN` from `.env`:
+
+```json
+// .mcp.json
+{
+  "mcpServers": {
+    "yaucca": {
+      "command": "uv",
+      "args": ["run", "python", "-m", "yaucca.mcp_server"],
+      "env": {}
+    }
+  }
+}
+```
+
+### Rollback
+
+If the remote MCP server breaks, switch back to stdio:
+
+```bash
+# 1. Restore the stdio MCP config
+cd /path/to/yaucca
+git checkout HEAD -- .mcp.json
+# Or manually: replace the "type":"url" entry with the "command":"uv" entry above
+
+# 2. If hooks are also broken, uninstall them
+uv run python -m yaucca.install --uninstall
+
+# 3. If Modal is down, the stdio proxy will also fail (both call the cloud API).
+#    As a last resort, restore the old Letta-based system:
+cp ~/.claude/settings.json.bak ~/.claude/settings.json
+```
+
+The SQLite database on Modal's persistent volume is never modified by
+rollback — your memory is always safe.
 
 ### Verify
 
