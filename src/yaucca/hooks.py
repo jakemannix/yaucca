@@ -11,9 +11,10 @@ Three subcommands:
                   tagged "exchange". Cheap HTTP POSTs, no LLM calls.
 
   session_end   — Fired on SessionEnd (when the session actually closes).
-                  Layers 2+3: a single `claude -p` call generates both an archival
-                  summary (persisted tagged "summary") and a compact context block
-                  update (written to the 'context' memory block).
+                  Forks a detached background worker (survives Claude Code exit)
+                  that runs Layers 2+3: a single `claude -p` call generates both
+                  an archival summary and a compact context block update.
+                  Logs to ~/.yaucca/session_end.log.
 
 All use httpx to call the yaucca cloud HTTP API.
 All diagnostic logging goes to stderr so stdout stays clean for Claude Code.
@@ -614,35 +615,19 @@ def stop(hook_input: dict[str, Any]) -> None:
     _save_session_state(state)
 
 
-def session_end(hook_input: dict[str, Any]) -> None:
-    """Handle SessionEnd hook: summarize session + update context block (Layers 2+3).
+def _session_end_worker(
+    transcript_path: str,
+    session_id: str,
+    project_name: str,
+    cwd: str,
+) -> None:
+    """Background worker for session summarization (Layers 2+3).
 
-    Fires once when the session actually closes. Generates a single `claude -p`
-    call that produces both an archival summary and a compact context block for
-    the next session's cold start.
+    Runs in a detached subprocess so it survives Claude Code's session exit.
+    Reads the transcript, calls claude -p, and persists summary + context block.
     """
-    if os.environ.get("YAUCCA_SKIP_HOOKS"):
-        return
-
-    transcript_path = hook_input.get("transcript_path", "")
-    logger.info(
-        "SessionEnd hook: keys=%s transcript_exists=%s",
-        list(hook_input.keys()),
-        bool(transcript_path and Path(transcript_path).exists()),
-    )
-    if not transcript_path:
-        logger.debug("No transcript_path in hook input")
-        return
-
-    session_id = hook_input.get("session_id", "unknown")
-    cwd = hook_input.get("cwd", "")
-    project_name = Path(cwd).name if cwd else "unknown"
-
     settings = get_settings()
     summary_config = settings.summary
-    if not summary_config.enabled:
-        logger.debug("Summarization disabled")
-        return
 
     # Extract all turns for full-session summary
     all_turns, _, total_lines = _extract_turns(transcript_path, start_line=0)
@@ -663,9 +648,6 @@ def session_end(hook_input: dict[str, Any]) -> None:
         client, _ = _cloud_client()
         client.get("/health").raise_for_status()
     except Exception as e:
-        if settings.cloud.required:
-            logger.error("FATAL: Cannot summarize (YAUCCA_REQUIRED=true): %s", e)
-            sys.exit(1)
         logger.error("Failed to connect to yaucca cloud: %s", e)
         return
 
@@ -712,6 +694,64 @@ def session_end(hook_input: dict[str, Any]) -> None:
             logger.warning("Failed to update context block: %s", e)
 
     _save_session_state(state)
+
+
+def session_end(hook_input: dict[str, Any]) -> None:
+    """Handle SessionEnd hook: fork a detached worker for summarization.
+
+    Claude Code's SessionEnd has a very short timeout (~1.5s) that kills hooks
+    quickly. We can't run claude -p inline. Instead, we fork a detached subprocess
+    that runs _session_end_worker and survives the parent's exit.
+    """
+    if os.environ.get("YAUCCA_SKIP_HOOKS"):
+        return
+
+    transcript_path = hook_input.get("transcript_path", "")
+    if not transcript_path or not Path(transcript_path).exists():
+        return
+
+    session_id = hook_input.get("session_id", "unknown")
+    cwd = hook_input.get("cwd", "")
+    project_name = Path(cwd).name if cwd else "unknown"
+
+    settings = get_settings()
+    if not settings.summary.enabled:
+        return
+
+    logger.info("SessionEnd: forking background summarization worker")
+
+    # Fork a detached subprocess that calls _session_end_worker via CLI.
+    # This survives Claude Code's process exit.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDECODE") and k != "CLAUDE_CODE_ENTRYPOINT"}
+    env["YAUCCA_SKIP_HOOKS"] = "1"
+
+    # Use the same Python that's running this hook
+    python = sys.executable
+    worker_script = f"""\
+import sys
+sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})
+from yaucca.hooks import _session_end_worker
+_session_end_worker(
+    transcript_path={transcript_path!r},
+    session_id={session_id!r},
+    project_name={project_name!r},
+    cwd={cwd!r},
+)
+"""
+
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        log_file = open(STATE_DIR / "session_end.log", "a")  # noqa: SIM115
+        subprocess.Popen(
+            [python, "-c", worker_script],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=log_file,
+            start_new_session=True,  # Detach from parent process group
+        )
+        logger.info("Background worker forked successfully")
+    except Exception as e:
+        logger.error("Failed to fork background worker: %s", e)
 
 
 def status() -> None:
