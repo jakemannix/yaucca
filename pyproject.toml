@@ -1,6 +1,6 @@
 [project]
 name = "yaucca"
-version = "0.1.0"
+version = "0.2.0"
 description = "Persistent long-term memory for Claude Code — cloud-native with SQLite + Modal"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -44,14 +44,15 @@ dev = [
     "ruff>=0.4.0",
     "mypy>=1.10.0",
 ]
-# Letta SDK only needed for one-time migration from v1
-migrate = [
-    "letta-client>=1.7.6",
-]
 
 [project.scripts]
 yaucca-install = "yaucca.install:main"
 yaucca-deploy-secrets = "yaucca.deploy_secrets:main"
+
+[project.urls]
+Homepage = "https://github.com/jakemannix/yaucca"
+Repository = "https://github.com/jakemannix/yaucca"
+Issues = "https://github.com/jakemannix/yaucca/issues"
 
 [build-system]
 requires = ["hatchling"]
