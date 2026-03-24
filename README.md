@@ -113,13 +113,23 @@ On every machine or cloud environment where you use Claude Code:
 ```bash
 uv pip install yaucca
 
-# Install hooks into ~/.claude/settings.json
+# Install hooks + memory rules template
 yaucca-install
 
 # Add the remote MCP server
 claude mcp add --transport http -s user yaucca \
   https://<your-modal-username>--yaucca-serve.modal.run/mcp
 ```
+
+`yaucca-install` does three things:
+
+1. **Hooks** → added to `~/.claude/settings.json` (SessionStart, Stop,
+   SessionEnd — see [Hook lifecycle](#hook-lifecycle) below)
+2. **Memory rules** → installed at `~/.claude/rules/yaucca-memory.md` —
+   teaches Claude how to use the memory blocks (read-modify-write, hygiene,
+   when to update each block). Edit this file to customize.
+3. **`.env` check** → warns if `YAUCCA_URL` / `YAUCCA_AUTH_TOKEN` aren't
+   configured
 
 First-time MCP auth:
 
@@ -129,7 +139,8 @@ First-time MCP auth:
 
 **Claude.ai web / mobile:** Settings → Integrations → Add custom
 integration → paste `https://<your-modal-username>--yaucca-serve.modal.run/mcp`
-→ GitHub OAuth.
+→ GitHub OAuth. No hooks on these surfaces — use MCP tools directly, or
+add instructions to your Claude.ai project to call them.
 
 **Claude Code cloud environments:** Add to your setup script:
 
@@ -139,6 +150,26 @@ uv pip install yaucca && yaucca-install
 
 Set `YAUCCA_URL` + `YAUCCA_AUTH_TOKEN` as environment variables in the
 cloud environment config.
+
+### First session — seeding memory
+
+On your first session, memory blocks are empty. Claude will start populating
+them as you work — the memory rules template guides it on what goes where.
+You can also seed blocks manually via the MCP tools:
+
+```
+> Use the yaucca tools to update the "user" block with: "Name: ..."
+> Update the "projects" block with my current active projects.
+```
+
+Or via the REST API:
+
+```bash
+curl -X PUT "$YAUCCA_URL/api/blocks/user" \
+  -H "Authorization: Bearer $YAUCCA_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"value": "Name: Your Name\nRole: ..."}'
+```
 
 ### Hook lifecycle
 
