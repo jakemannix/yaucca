@@ -10,6 +10,7 @@ Preserves all other settings. Creates a backup before modifying.
 """
 
 import argparse
+import importlib.resources
 import json
 import shutil
 from pathlib import Path
@@ -130,6 +131,28 @@ def install() -> None:
     else:
         print(f".env found at {env_file}")
 
+    # Offer to install memory rules template
+    _install_rules_template()
+
+
+def _install_rules_template() -> None:
+    """Install the yaucca memory rules template into ~/.claude/rules/."""
+    rules_dir = Path.home() / ".claude" / "rules"
+    target = rules_dir / "yaucca-memory.md"
+
+    if target.exists():
+        print(f"Memory rules already installed at {target}")
+        return
+
+    # Read the template from the package
+    template_ref = importlib.resources.files("yaucca.templates").joinpath("memory-rules.md")
+    template_text = template_ref.read_text(encoding="utf-8")
+
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    target.write_text(template_text)
+    print(f"Installed memory rules template at {target}")
+    print("  Edit this file to customize how Claude uses your memory blocks.")
+
 
 def uninstall() -> None:
     settings = _load_settings()
@@ -154,6 +177,12 @@ def uninstall() -> None:
     _save_settings(settings)
     print("Removed yaucca hooks from Claude Code settings")
     print("To restore the backup: cp ~/.claude/settings.json.bak ~/.claude/settings.json")
+
+    # Remove rules template if it exists
+    rules_file = Path.home() / ".claude" / "rules" / "yaucca-memory.md"
+    if rules_file.exists():
+        rules_file.unlink()
+        print(f"Removed memory rules at {rules_file}")
 
 
 def main() -> None:

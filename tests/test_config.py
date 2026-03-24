@@ -2,21 +2,7 @@
 
 from unittest.mock import patch
 
-from yaucca.config import AgentConfig, CloudConfig, LettaConfig, Settings, SummarizationConfig
-
-
-class TestLettaConfig:
-    def test_defaults(self) -> None:
-        with patch.dict("os.environ", {}, clear=True):
-            config = LettaConfig(base_url="http://localhost:8283", _env_file=None)
-            assert config.base_url == "http://localhost:8283"
-            assert config.api_key is None
-
-    def test_env_override(self) -> None:
-        with patch.dict("os.environ", {"LETTA_BASE_URL": "https://api.letta.com", "LETTA_API_KEY": "sk-test"}):
-            config = LettaConfig()
-            assert config.base_url == "https://api.letta.com"
-            assert config.api_key == "sk-test"
+from yaucca.config import CloudConfig, Settings, SummarizationConfig
 
 
 class TestCloudConfig:
@@ -31,18 +17,6 @@ class TestCloudConfig:
             config = CloudConfig()
             assert config.url == "https://yaucca.modal.run"
             assert config.auth_token == "secret"
-
-
-class TestAgentConfig:
-    def test_defaults(self) -> None:
-        with patch.dict("os.environ", {}, clear=True):
-            config = AgentConfig(_env_file=None)
-            assert config.agent_id is None
-
-    def test_env_override(self) -> None:
-        with patch.dict("os.environ", {"YAUCCA_AGENT_ID": "agent-abc-123"}):
-            config = AgentConfig()
-            assert config.agent_id == "agent-abc-123"
 
 
 class TestSummarizationConfig:
@@ -79,12 +53,6 @@ class TestSummarizationConfig:
 
 
 class TestSettings:
-    def test_aggregated(self) -> None:
-        with patch.dict("os.environ", {"LETTA_BASE_URL": "http://test:8283", "YAUCCA_AGENT_ID": "agent-xyz"}):
-            settings = Settings()
-            assert settings.letta.base_url == "http://test:8283"
-            assert settings.agent.agent_id == "agent-xyz"
-
     def test_includes_cloud(self) -> None:
         with patch.dict("os.environ", {"YAUCCA_URL": "https://test.modal.run"}):
             settings = Settings()
