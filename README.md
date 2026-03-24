@@ -83,43 +83,23 @@ YAUCCA_AUTH_TOKEN=$YAUCCA_AUTH_TOKEN
 EOF
 ```
 
-### Configure Claude Code
+### Install hooks
 
-Add to `~/.claude/settings.json`. The hooks read `YAUCCA_URL` and
-`YAUCCA_AUTH_TOKEN` from the `.env` file in the project directory — no
-inline env vars needed:
+```bash
+# Install SessionStart + Stop hooks into ~/.claude/settings.json
+uv run python -m yaucca.install
 
-```json
-{
-  "hooks": {
-    "SessionStart": [{
-      "type": "command",
-      "command": "cd /path/to/yaucca && uv run python -m yaucca.hooks session_start",
-      "timeout": 30
-    }],
-    "Stop": [{
-      "type": "command",
-      "command": "cd /path/to/yaucca && uv run python -m yaucca.hooks stop",
-      "timeout": 120
-    }]
-  }
-}
+# To uninstall (restores backup):
+uv run python -m yaucca.install --uninstall
 ```
 
-Add MCP server in your project or global `.mcp.json`. The MCP server also
-reads from `.env` via pydantic-settings, but you can set env vars explicitly
-if the working directory differs:
+This auto-detects the project directory and creates a backup at
+`~/.claude/settings.json.bak`. Hooks read credentials from the `.env`
+file — no inline env vars needed.
 
-```json
-{
-  "mcpServers": {
-    "yaucca": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/yaucca", "python", "-m", "yaucca.mcp_server"]
-    }
-  }
-}
-```
+The `.mcp.json` in the project root is already configured for the MCP
+server. If you need it globally, copy the `yaucca` entry to
+`~/.claude/.mcp.json`.
 
 ### Verify
 
@@ -195,34 +175,32 @@ uv run python -m yaucca.hooks status
 
 ### Step 4: Switch over
 
-Edit `~/.claude/settings.json` to point hooks at this repo (see "Configure
-Claude Code" above). The `.env` file provides the cloud credentials.
+```bash
+cd /path/to/yaucca
+uv run python -m yaucca.install
+```
+
+This replaces any existing yaucca hooks with ones pointing at this repo.
+A backup is saved to `~/.claude/settings.json.bak`.
 
 ### Step 5: Rollback if something breaks
 
 The old Letta-based system is still intact. To revert:
 
-1. Restore the hooks in `~/.claude/settings.json` to point at the old repo
-   and remove the `YAUCCA_URL`/`YAUCCA_AUTH_TOKEN` env vars:
+```bash
+# Option A: uninstall yaucca hooks entirely
+cd /path/to/yaucca
+uv run python -m yaucca.install --uninstall
 
-   ```json
-   {
-     "hooks": {
-       "SessionStart": [{
-         "type": "command",
-         "command": "cd /path/to/old/yetanotheruseless_claude_code_agent && uv run python -m yaucca.hooks session_start"
-       }],
-       "Stop": [{
-         "type": "command",
-         "command": "cd /path/to/old/yetanotheruseless_claude_code_agent && uv run python -m yaucca.hooks stop"
-       }]
-     }
-   }
-   ```
+# Then re-install the old Letta-based hooks from the old repo
+cd /path/to/old/yetanotheruseless_claude_code_agent
+uv run python -m yaucca.install
 
-2. Revert `.mcp.json` to the old config (no `env` block, runs from old repo).
+# Option B: just restore the backup
+cp ~/.claude/settings.json.bak ~/.claude/settings.json
+```
 
-3. Verify Letta is still running: `curl http://localhost:8283/v1/health`
+Verify Letta is still running: `curl http://localhost:8283/v1/health`
 
 No data is lost — Letta still has all your original memory. Any new data
 written to the cloud during testing is simply extra; it won't conflict.
