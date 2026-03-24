@@ -11,13 +11,14 @@ context compactions.
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│  Modal.com (scale-to-zero, ~$0-1/month)         │
-│                                                  │
-│  FastAPI + SQLite + sqlite-vec + Qwen3 embeddings│
-│  Persistent volume: /data/yaucca.db              │
-└────────────────┬─────────────────────────────────┘
-                 │ HTTPS + Bearer token
+┌──────────────────────────────────────────────────────┐
+│  Modal.com (scale-to-zero, ~$0-1/month)              │
+│                                                       │
+│  FastAPI + SQLite + sqlite-vec + Qwen3 embeddings     │
+│  Remote MCP (OAuth 2.1 + GitHub login)                │
+│  Persistent volume: /data/yaucca.db                   │
+└────────────────┬──────────────────────────────────────┘
+                 │ HTTPS
     ┌────────────┼────────────┐
     │            │            │
 ┌───┴────┐ ┌────┴───┐ ┌─────┴────┐
@@ -26,8 +27,8 @@ context compactions.
 │(laptop)│ │ (web)  │ │ (phone)  │
 │        │ │        │ │          │
 │ hooks  │ │ remote │ │ remote   │
-│ + MCP  │ │ MCP    │ │ MCP      │
-│ (stdio)│ │(Ph. 2) │ │ (Ph. 2)  │
+│+remote │ │ MCP    │ │ MCP      │
+│  MCP   │ │        │ │          │
 └────────┘ └────────┘ └──────────┘
 ```
 
@@ -41,123 +42,80 @@ context compactions.
 
 ## Quick Start
 
-### Prerequisites
-
-- Python 3.11+
-- [uv](https://docs.astral.sh/uv/)
-- [Modal](https://modal.com) account (free tier works)
-- OpenRouter API key (for embeddings)
-
-### Deploy
+### Step 1: Deploy your backend (once, from your laptop)
 
 ```bash
-git clone https://github.com/jakemannix/yaucca.git
-cd yaucca
-uv sync --extra dev
+# Install with deployment deps
+uv pip install yaucca[deploy]
 
 # Authenticate with Modal (one-time)
-uv run --extra deploy modal setup
+modal setup
 
-# Generate an auth token and create Modal secrets
-YAUCCA_AUTH_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
-uv run --extra deploy modal secret create yaucca-secrets \
-  YAUCCA_AUTH_TOKEN="$YAUCCA_AUTH_TOKEN" \
-  OPENROUTER_API_KEY=<your-key>
+# Create a GitHub OAuth App at https://github.com/settings/developers
+#   Homepage URL: https://<your-username>--yaucca-serve.modal.run
+#   Callback URL: https://<your-username>--yaucca-serve.modal.run/oauth/github/callback
 
-# Deploy
-uv run --extra deploy modal deploy src/yaucca/cloud/modal_app.py
+# Create .env with your credentials
+cat > .env << 'EOF'
+YAUCCA_URL=https://<your-username>--yaucca-serve.modal.run
+YAUCCA_AUTH_TOKEN=<generate-with: python3 -c "import secrets; print(secrets.token_urlsafe(32))">
+OPENROUTER_API_KEY=<your-openrouter-key>
+YAUCCA_ISSUER_URL=https://<your-username>--yaucca-serve.modal.run
+GITHUB_CLIENT_ID=<from-github-oauth-app>
+GITHUB_CLIENT_SECRET=<from-github-oauth-app>
+GITHUB_ALLOWED_USERS=<your-github-username>
+EOF
+
+# Push secrets to Modal and deploy
+yaucca-deploy-secrets
+modal deploy src/yaucca/cloud/modal_app.py
 
 # Verify
 curl https://<your-username>--yaucca-serve.modal.run/health
 ```
 
-### Create `.env`
+### Step 2: Use it everywhere
 
-Save your credentials in `.env` (gitignored) so hooks and MCP tools pick
-them up automatically:
-
-```bash
-cat > .env << EOF
-YAUCCA_URL=https://<your-username>--yaucca-serve.modal.run
-YAUCCA_AUTH_TOKEN=$YAUCCA_AUTH_TOKEN
-EOF
-```
-
-### Install hooks
+On every machine or cloud environment where you use Claude Code:
 
 ```bash
-# Install SessionStart + Stop + SessionEnd hooks into ~/.claude/settings.json
-uv run python -m yaucca.install
+# Install the client (hooks only — lightweight)
+uv pip install yaucca
 
-# To uninstall (restores backup):
-uv run python -m yaucca.install --uninstall
+# Install hooks into ~/.claude/settings.json
+yaucca-install
+
+# Add the remote MCP server
+claude mcp add --transport http -s project yaucca \
+  https://<your-username>--yaucca-serve.modal.run/mcp
 ```
 
-This auto-detects the project directory and creates a backup at
-`~/.claude/settings.json.bak`. Hooks read credentials from the `.env`
-file — no inline env vars needed.
+**First-time MCP auth:** Claude Code will show `! Needs authentication`
+for the yaucca server. To connect:
 
-**Hook lifecycle:**
+1. Type `/mcp` in the Claude Code prompt
+2. Select yaucca → browser opens → GitHub login → authorize
+3. "Authentication successful. Connected to yaucca."
+4. All 7 memory tools are now available
+
+The OAuth token is cached and refreshed automatically.
+
+### Hook lifecycle
+
 - **SessionStart**: Injects memory context (core blocks + recent exchanges)
 - **Stop** (every turn): Persists raw exchanges to archival — cheap HTTP POSTs, no LLM calls
 - **SessionEnd** (on exit): Single `claude -p` call generates both an archival summary and an updated context block
 
-### MCP server (two options)
-
-**Option A: Remote MCP (recommended)** — Claude.ai, mobile, and Claude Code
-all connect to the same remote MCP server via OAuth 2.1 + GitHub login:
-
-```bash
-# Add via CLI (creates the correct .mcp.json entry):
-claude mcp add --transport http -s project yaucca https://jakemannix--yaucca-serve.modal.run/mcp
-```
-
-This creates the `.mcp.json` entry with `"type": "http"` (not `"url"`).
-
-**First-time auth:** On first connect, Claude Code will show `! Needs authentication`
-for the yaucca server. To trigger the OAuth flow:
-
-1. Type `/mcp` in the Claude Code prompt
-2. Select the yaucca server → "Authenticate"
-3. Browser opens → GitHub OAuth login → authorize the `yaucca` app
-4. Browser redirects back → "Authentication successful. Connected to yaucca."
-5. All 7 memory tools are now available
-
-The OAuth token is cached and refreshed automatically — you only need to
-authenticate once per device.
-
-**Option B: Stdio proxy (fallback)** — local subprocess proxies to the cloud
-API via HTTP. No OAuth, uses `YAUCCA_AUTH_TOKEN` from `.env`:
-
-```json
-// .mcp.json
-{
-  "mcpServers": {
-    "yaucca": {
-      "command": "uv",
-      "args": ["run", "python", "-m", "yaucca.mcp_server"],
-      "env": {}
-    }
-  }
-}
-```
-
 ### Rollback
 
-If the remote MCP server breaks, switch back to stdio:
-
 ```bash
-# 1. Restore the stdio MCP config
-cd /path/to/yaucca
+# If hooks are broken, uninstall them
+yaucca-install --uninstall
+
+# If MCP is broken, remove it
 claude mcp remove -s project yaucca
-claude mcp add -s project yaucca -- uv run python -m yaucca.mcp_server
-# Or manually: replace the "type":"http" entry with the "command":"uv" entry above
 
-# 2. If hooks are also broken, uninstall them
-uv run python -m yaucca.install --uninstall
-
-# 3. If Modal is down, the stdio proxy will also fail (both call the cloud API).
-#    As a last resort, restore the old Letta-based system:
+# Restore a backup of settings.json
 cp ~/.claude/settings.json.bak ~/.claude/settings.json
 ```
 
@@ -167,10 +125,8 @@ rollback — your memory is always safe.
 ### Verify
 
 ```bash
-cd /path/to/yaucca
-
 # Test SessionStart hook — should print XML memory context to stdout
-echo '{"source":"startup"}' | uv run python -m yaucca.hooks session_start
+echo '{"source":"startup"}' | python -m yaucca.hooks session_start
 
 # If it prints nothing, check stderr for errors.
 # First run may be slow (~5s) due to Modal cold start.
@@ -373,8 +329,10 @@ truncations of the same model):
 ## Development
 
 ```bash
-uv sync --extra dev                # Install deps (includes sqlite-vec)
-uv run pytest                      # Unit tests (98 tests)
+git clone https://github.com/jakemannix/yaucca.git
+cd yaucca
+uv sync --extra dev                # Install all deps (client + server + test)
+uv run pytest                      # Unit tests (114 tests)
 uv run ruff check . && ruff format .  # Lint + format
 uv run mypy src/yaucca             # Type check
 ```

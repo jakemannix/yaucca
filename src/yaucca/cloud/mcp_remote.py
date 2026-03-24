@@ -61,7 +61,7 @@ def create_remote_mcp(
         ),
     )
 
-    # --- Tools (same interface as mcp_server.py, but call DB directly) ---
+    # --- Memory tools (call DB directly) ---
 
     @mcp.tool()
     async def get_memory_block(block_name: str) -> str:

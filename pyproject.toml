@@ -1,6 +1,6 @@
 [project]
 name = "yaucca"
-version = "0.2.0"
+version = "0.1.0"
 description = "Persistent long-term memory for Claude Code — cloud-native with SQLite + Modal"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -19,38 +19,39 @@ classifiers = [
 ]
 
 dependencies = [
-    "mcp>=1.2.0",
     "httpx>=0.27.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
-    "fastapi>=0.115.0",
-    "uvicorn>=0.30.0",
 ]
 
 [project.optional-dependencies]
+# Server + deployment: everything to deploy your own yaucca backend on Modal
+deploy = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "mcp>=1.25.0",
+    "sse-starlette>=2.0.0",
+    "sqlite-vec>=0.1.0",
+    "modal>=0.64.0",
+    "python-dotenv>=0.21.0",
+]
+# Development: deploy deps + test/lint tools
 dev = [
+    "yaucca[deploy]",
     "pytest>=8.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.23.0",
     "ruff>=0.4.0",
     "mypy>=1.10.0",
-    "sqlite-vec>=0.1.0",
 ]
-# Letta SDK only needed for one-time migration
+# Letta SDK only needed for one-time migration from v1
 migrate = [
     "letta-client>=1.7.6",
 ]
-# Modal SDK for deployment
-deploy = [
-    "modal>=0.64.0",
-]
-# Optional: sqlite-vec for vector search
-vec = [
-    "sqlite-vec>=0.1.0",
-]
 
 [project.scripts]
-yaucca-hooks = "yaucca.hooks:main"
+yaucca-install = "yaucca.install:main"
+yaucca-deploy-secrets = "yaucca.deploy_secrets:main"
 
 [build-system]
 requires = ["hatchling"]

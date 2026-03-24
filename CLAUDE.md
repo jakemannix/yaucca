@@ -11,19 +11,17 @@ yaucca (Yet Another Useless Claude Code Agent) gives Claude Code persistent long
 
 ## Architecture
 
-- **MCP Server** (`src/yaucca/mcp_server.py`): FastMCP stdio server with 6 memory tools
 - **Hooks** (`src/yaucca/hooks.py`): SessionStart + Stop + SessionEnd lifecycle scripts
 - **Prompt** (`src/yaucca/prompt.py`): Memory rendering (XML blocks, metadata, recall)
 - **Config** (`src/yaucca/config.py`): Pydantic settings for cloud connection
-- **Cloud** (`src/yaucca/cloud/`): FastAPI server, SQLite + sqlite-vec DB, Modal deployment
+- **Cloud** (`src/yaucca/cloud/`): FastAPI server + remote MCP (OAuth 2.1), SQLite + sqlite-vec, Modal deployment
 
 ## Development
 
 ```bash
-uv sync                           # Install deps
+uv sync --extra dev               # Install all deps (client + server + test)
 uv run pytest                     # Run unit tests
 uv run pytest --cov               # With coverage
-uv run pytest -k integration      # Integration tests (needs Letta)
 uv run ruff check .               # Lint
 uv run ruff format .              # Format
 uv run mypy src/yaucca            # Type check
@@ -31,8 +29,10 @@ uv run mypy src/yaucca            # Type check
 
 ## Key Design Decisions
 
-- FastMCP (not Claude Agent SDK) — native stdio MCP server for Claude Code
+- Remote MCP with OAuth 2.1 + GitHub authentication (7 tools)
 - Cloud backend: SQLite + sqlite-vec on Modal.com (replaced Letta)
+- Client install (`uv pip install yaucca`) = hooks only (httpx + pydantic-settings)
+- Deploy install (`uv pip install yaucca[deploy]`) = server + Modal deployment
 - Stop hook = Layer 1 only (raw turn persistence, no LLM calls)
 - SessionEnd hook = Layers 2+3 (single `claude -p` for summary + context block)
 - 5 memory blocks: user, projects, patterns, learnings, context

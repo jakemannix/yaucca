@@ -141,27 +141,28 @@ Bearer token auth on all routes except `/health`.
 
 ## MCP Tool Interface
 
-The 6 MCP tools are unchanged in interface from v1. Implementation changed from
-Letta API calls to cloud HTTP API calls:
+The 7 MCP tools are served via the remote MCP server (`cloud/mcp_remote.py`)
+with OAuth 2.1 + GitHub authentication. Tools call the database directly:
 
-| Tool | v1 (Letta) | v2 (Cloud API) |
-|------|-----------|----------------|
-| `get_memory_block(name)` | `blocks.retrieve()` | `GET /api/blocks/{name}` |
-| `update_memory_block(name, value)` | `blocks.update()` | `PUT /api/blocks/{name}` |
-| `list_memory_blocks()` | `blocks.list()` | `GET /api/blocks` |
-| `search_archival_memory(query)` | `passages.search()` | `GET /api/passages/search?q=` |
-| `insert_archival_memory(text)` | `archives.passages.create()` | `POST /api/passages` |
-| `get_recent_messages(count)` | `passages.list()` | `GET /api/passages?tag=exchange` |
+| Tool | Description |
+|------|-------------|
+| `get_memory_block(name)` | Read a core memory block |
+| `update_memory_block(name, value)` | Replace a core memory block |
+| `list_memory_blocks()` | List all blocks with sizes |
+| `search_archival_memory(query, count, max_chars)` | Semantic vector search with truncation |
+| `get_passages(ids, max_chars, offset)` | Fetch full text of specific passages |
+| `insert_archival_memory(text)` | Store a new archival entry |
+| `get_recent_messages(count)` | Recent conversation exchanges |
 
 ## File Structure
 
 ```
 src/yaucca/
-  # Core (rewritten to use cloud API)
-  mcp_server.py          # stdio MCP server — proxies to cloud HTTP API
-  hooks.py               # SessionStart/Stop — calls cloud HTTP API
+  # Client (installed everywhere via `uv pip install yaucca`)
+  hooks.py               # SessionStart/Stop/SessionEnd — calls cloud HTTP API
   prompt.py              # XML rendering (unchanged from v1)
-  config.py              # YAUCCA_URL + YAUCCA_AUTH_TOKEN (Letta config kept for migration)
+  config.py              # YAUCCA_URL + YAUCCA_AUTH_TOKEN
+  install.py             # Install hooks into ~/.claude/settings.json
 
   # Cloud server
   cloud/

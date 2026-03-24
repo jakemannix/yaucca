@@ -4,8 +4,8 @@
 
 | Phase | Status |
 |-------|--------|
-| Phase 1: Storage + HTTP API + Modal | **Deployed and tested** — cutover to hooks/MCP pending |
-| Phase 2: Remote MCP (multi-surface) | Not started |
+| Phase 1: Storage + HTTP API + Modal | **Complete** |
+| Phase 2: Remote MCP (multi-surface) | **Deployed and tested** — OAuth 2.1 + GitHub auth, 7 tools, Claude Code + Claude.ai verified |
 | Phase 3: GTD System | Not started |
 
 ---

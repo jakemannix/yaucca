@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "yaucca": {
-      "type": "url",
+      "type": "http",
       "url": "https://jakemannix--yaucca-serve.modal.run/mcp"
     }
   }
