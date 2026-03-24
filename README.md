@@ -58,9 +58,10 @@ uv sync --extra dev
 # Authenticate with Modal (one-time)
 uv run --extra deploy modal setup
 
-# Create secrets
-modal secret create yaucca-secrets \
-  YAUCCA_AUTH_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))") \
+# Generate an auth token and create Modal secrets
+YAUCCA_AUTH_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+uv run --extra deploy modal secret create yaucca-secrets \
+  YAUCCA_AUTH_TOKEN="$YAUCCA_AUTH_TOKEN" \
   OPENROUTER_API_KEY=<your-key>
 
 # Deploy
@@ -70,37 +71,51 @@ uv run --extra deploy modal deploy src/yaucca/cloud/modal_app.py
 curl https://<your-username>--yaucca-serve.modal.run/health
 ```
 
+### Create `.env`
+
+Save your credentials in `.env` (gitignored) so hooks and MCP tools pick
+them up automatically:
+
+```bash
+cat > .env << EOF
+YAUCCA_URL=https://<your-username>--yaucca-serve.modal.run
+YAUCCA_AUTH_TOKEN=$YAUCCA_AUTH_TOKEN
+EOF
+```
+
 ### Configure Claude Code
 
-Add to `~/.claude/settings.json`:
+Add to `~/.claude/settings.json`. The hooks read `YAUCCA_URL` and
+`YAUCCA_AUTH_TOKEN` from the `.env` file in the project directory — no
+inline env vars needed:
 
 ```json
 {
   "hooks": {
     "SessionStart": [{
       "type": "command",
-      "command": "cd /path/to/yaucca && YAUCCA_URL=https://<url>.modal.run YAUCCA_AUTH_TOKEN=<token> uv run python -m yaucca.hooks session_start"
+      "command": "cd /path/to/yaucca && uv run python -m yaucca.hooks session_start",
+      "timeout": 30
     }],
     "Stop": [{
       "type": "command",
-      "command": "cd /path/to/yaucca && YAUCCA_URL=https://<url>.modal.run YAUCCA_AUTH_TOKEN=<token> uv run python -m yaucca.hooks stop"
+      "command": "cd /path/to/yaucca && uv run python -m yaucca.hooks stop",
+      "timeout": 120
     }]
   }
 }
 ```
 
-Add MCP server in your project or global `.mcp.json`:
+Add MCP server in your project or global `.mcp.json`. The MCP server also
+reads from `.env` via pydantic-settings, but you can set env vars explicitly
+if the working directory differs:
 
 ```json
 {
   "mcpServers": {
     "yaucca": {
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/yaucca", "python", "-m", "yaucca.mcp_server"],
-      "env": {
-        "YAUCCA_URL": "https://<url>.modal.run",
-        "YAUCCA_AUTH_TOKEN": "<token>"
-      }
+      "args": ["run", "--directory", "/path/to/yaucca", "python", "-m", "yaucca.mcp_server"]
     }
   }
 }
@@ -109,12 +124,13 @@ Add MCP server in your project or global `.mcp.json`:
 ### Verify
 
 ```bash
-# Test SessionStart hook
-YAUCCA_URL=https://<url>.modal.run YAUCCA_AUTH_TOKEN=<token> \
-  echo '{"source":"startup"}' | uv run python -m yaucca.hooks session_start
+cd /path/to/yaucca
 
-# Should print XML memory context to stdout.
+# Test SessionStart hook — should print XML memory context to stdout
+echo '{"source":"startup"}' | uv run python -m yaucca.hooks session_start
+
 # If it prints nothing, check stderr for errors.
+# First run may be slow (~5s) due to Modal cold start.
 
 # Open Claude Code — it should load your memory context
 claude
@@ -127,10 +143,15 @@ data is untouched throughout — this is a copy, not a move.**
 
 ### Step 1: Migrate data
 
+Make sure `.env` has both the cloud config and the Letta config:
+
 ```bash
-YAUCCA_URL=https://<url>.modal.run \
-YAUCCA_AUTH_TOKEN=<token> \
-YAUCCA_AGENT_ID=<your-letta-agent-id> \
+# .env should contain:
+# YAUCCA_URL=https://<url>.modal.run
+# YAUCCA_AUTH_TOKEN=<token>
+# LETTA_BASE_URL=http://localhost:8283
+# YAUCCA_AGENT_ID=<your-letta-agent-id>
+
 uv run --extra migrate python -m yaucca.cloud.migrate
 ```
 
@@ -139,40 +160,43 @@ Safe to re-run — deduplicates by text content.
 ### Step 2: Verify cloud data
 
 ```bash
+# source .env for curl commands
+source .env
+
 # Check blocks
-curl -s https://<url>.modal.run/api/blocks \
-  -H "Authorization: Bearer <token>" | python3 -m json.tool
+curl -s $YAUCCA_URL/api/blocks \
+  -H "Authorization: Bearer $YAUCCA_AUTH_TOKEN" | python3 -m json.tool
 
 # Check passage count
-curl -s "https://<url>.modal.run/api/passages?limit=1000" \
-  -H "Authorization: Bearer <token>" | python3 -c \
+curl -s "$YAUCCA_URL/api/passages?limit=1000" \
+  -H "Authorization: Bearer $YAUCCA_AUTH_TOKEN" | python3 -c \
   "import json,sys; print(f'{len(json.load(sys.stdin))} passages')"
 
 # Test vector search
-curl -s "https://<url>.modal.run/api/passages/search?q=test+query" \
-  -H "Authorization: Bearer <token>" | python3 -m json.tool
+curl -s "$YAUCCA_URL/api/passages/search?q=test+query" \
+  -H "Authorization: Bearer $YAUCCA_AUTH_TOKEN" | python3 -m json.tool
 
 # Health (includes vec status)
-curl -s https://<url>.modal.run/health \
-  -H "Authorization: Bearer <token>" | python3 -m json.tool
+curl -s $YAUCCA_URL/health \
+  -H "Authorization: Bearer $YAUCCA_AUTH_TOKEN" | python3 -m json.tool
 ```
 
 ### Step 3: Test hooks locally (without changing your live config)
 
 ```bash
-# Test SessionStart — should print XML memory from the cloud
-YAUCCA_URL=https://<url>.modal.run YAUCCA_AUTH_TOKEN=<token> \
-  echo '{"source":"startup"}' | uv run python -m yaucca.hooks session_start
+cd /path/to/yaucca
 
-# Test stop hook — create a fake transcript and verify it persists
-YAUCCA_URL=https://<url>.modal.run YAUCCA_AUTH_TOKEN=<token> \
-  uv run python -m yaucca.hooks status
+# Test SessionStart — should print XML memory from the cloud
+echo '{"source":"startup"}' | uv run python -m yaucca.hooks session_start
+
+# Check passage stats
+uv run python -m yaucca.hooks status
 ```
 
 ### Step 4: Switch over
 
-Edit `~/.claude/settings.json` to point hooks at the cloud (see "Configure
-Claude Code" above). Update `.mcp.json` with the cloud URL and token.
+Edit `~/.claude/settings.json` to point hooks at this repo (see "Configure
+Claude Code" above). The `.env` file provides the cloud credentials.
 
 ### Step 5: Rollback if something breaks
 
