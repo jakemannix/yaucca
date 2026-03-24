@@ -271,6 +271,19 @@ def create_app(
             for p in passages
         ]
 
+    @app.get("/api/passages/{passage_id}", dependencies=[Depends(_verify_token)])
+    async def get_passage(passage_id: str, db: Database = Depends(_get_db)) -> dict[str, Any]:
+        passage = db.get_passage(passage_id)
+        if not passage:
+            raise HTTPException(status_code=404, detail="Passage not found")
+        return {
+            "id": passage.id,
+            "text": passage.text,
+            "tags": passage.tags,
+            "metadata": passage.metadata,
+            "created_at": passage.created_at,
+        }
+
     # --- Admin endpoints ---
 
     @app.get("/api/admin/diagnostics", dependencies=[Depends(_verify_token)])

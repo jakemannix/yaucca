@@ -1,6 +1,6 @@
 """FastMCP server with cloud-backed memory tools for Claude Code.
 
-Exposes 6 tools for interacting with yaucca's persistent memory system.
+Exposes 7 tools for interacting with yaucca's persistent memory system.
 Runs as a stdio MCP server that Claude Code connects to via .mcp.json.
 All calls proxy through the yaucca cloud HTTP API.
 
@@ -80,17 +80,59 @@ async def update_memory_block(block_name: str, value: str) -> str:
 
 
 @mcp.tool()
-async def search_archival_memory(query: str, count: int = 10) -> str:
+async def search_archival_memory(query: str, count: int = 10, max_chars: int = 2000) -> str:
     """Search archival memory for past experiences and learnings.
 
     Uses semantic similarity search over all stored memories.
     Returns matching entries ranked by relevance.
+
+    Args:
+        query: Semantic search query.
+        count: Number of results to return.
+        max_chars: Max characters per result text (0 = no limit). Default 2000
+                   keeps results compact; increase for full passage retrieval.
     """
     assert _client is not None
     resp = await _client.get("/api/passages/search", params={"q": query, "top_k": count})
     resp.raise_for_status()
-    entries = [{"text": p["text"], "id": p["id"]} for p in resp.json()]
+    entries = []
+    for p in resp.json():
+        text = p["text"]
+        if max_chars and len(text) > max_chars:
+            text = text[:max_chars] + f"... [{len(p['text'])} chars total]"
+        entries.append({"text": text, "id": p["id"]})
     return str(entries)
+
+
+@mcp.tool()
+async def get_passages(ids: list[str], max_chars: int = 0, offset: int = 0) -> str:
+    """Fetch full text of specific passages by ID.
+
+    Use this after search_archival_memory to drill into interesting results.
+    Search returns truncated previews; this returns full (or windowed) text.
+
+    Args:
+        ids: List of passage IDs to fetch.
+        max_chars: Max characters per passage (0 = no limit).
+        offset: Character offset to start reading from (for paging through long passages).
+    """
+    assert _client is not None
+    results = []
+    for pid in ids:
+        resp = await _client.get(f"/api/passages/{pid}")
+        if resp.status_code == 404:
+            results.append({"id": pid, "error": "not found"})
+            continue
+        resp.raise_for_status()
+        p = resp.json()
+        text = p["text"]
+        total = len(text)
+        if offset:
+            text = text[offset:]
+        if max_chars and len(text) > max_chars:
+            text = text[:max_chars] + f"... [{total} chars total]"
+        results.append({"id": p["id"], "text": text, "total_chars": total})
+    return str(results)
 
 
 @mcp.tool()
