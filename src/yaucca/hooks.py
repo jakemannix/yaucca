@@ -1,22 +1,21 @@
 """Claude Code hook scripts for yaucca's stateful lifecycle.
 
-Two subcommands:
+Three subcommands:
 
   session_start — Fired on SessionStart (startup, resume, compact, clear).
                   Queries yaucca cloud for memory blocks + recent tagged passages,
                   renders XML context, and outputs to stdout as additionalContext.
 
   stop          — Fired on Stop (after each assistant turn completes).
-                  Three-layer persistence:
-                    Layer 1: Persists raw turns as individual archival passages
-                             tagged "exchange" (always runs).
-                    Layer 2: When summarization threshold is met, generates an
-                             LLM summary via `claude -p` and persists it tagged
-                             "summary" (non-catastrophic if it fails).
-                    Layer 3: Updates the 'context' memory block via `claude -p`
-                             so the next session starts oriented on recent work.
+                  Layer 1 only: persists raw turns as individual archival passages
+                  tagged "exchange". Cheap HTTP POSTs, no LLM calls.
 
-Both use httpx to call the yaucca cloud HTTP API.
+  session_end   — Fired on SessionEnd (when the session actually closes).
+                  Layers 2+3: a single `claude -p` call generates both an archival
+                  summary (persisted tagged "summary") and a compact context block
+                  update (written to the 'context' memory block).
+
+All use httpx to call the yaucca cloud HTTP API.
 All diagnostic logging goes to stderr so stdout stays clean for Claude Code.
 """
 
@@ -274,22 +273,41 @@ def _build_summary_prompt(
     session_id: str,
     max_chars: int,
 ) -> str:
-    """Build the prompt for claude -p to summarize a session."""
+    """Build the prompt for claude -p to summarize a session and generate a context block.
+
+    Returns a prompt that asks for JSON with two fields:
+      - summary: archival session summary (~500 words)
+      - context: compact orientation block for next session (3-8 lines)
+    """
+    now = datetime.now(UTC).strftime("%Y-%m-%d")
     transcript = _format_transcript_for_summary(turns, max_chars)
-    return f"""Summarize this Claude Code session concisely for future reference.
+    return f"""Analyze this Claude Code session and produce TWO outputs as a JSON object.
 
 Project: {project_name}
 Working directory: {cwd}
 Session ID: {session_id}
 Turns: {len(turns)}
 
-Focus on:
-1. What the user wanted to accomplish (goals)
-2. What was actually done (work completed)
-3. Key decisions made and their rationale
-4. Any unfinished work or next steps
+Return a JSON object with exactly two keys:
 
-Keep it under 500 words. Use bullet points. Start with a one-line summary.
+1. "summary" — A concise session summary for archival memory. Focus on:
+   - What the user wanted to accomplish (goals)
+   - What was actually done (work completed)
+   - Key decisions made and their rationale
+   - Any unfinished work or next steps
+   Keep under 500 words. Use bullet points. Start with a one-line summary.
+
+2. "context" — A compact orientation block (3-8 lines) loaded at the START of the
+   next conversation. Use this exact format:
+   Session: {now}. <one-line description of what repo/project was active>
+
+   ## Previous session recap
+   - <2-4 bullet points of what was accomplished>
+
+   ## Current state
+   - <1-2 bullets: what's in progress, what's next, any blockers>
+
+Output ONLY valid JSON — no markdown fences, no preamble, no explanation.
 
 --- Transcript ---
 {transcript}"""
@@ -349,71 +367,32 @@ def _should_summarize(new_turn_count: int, new_chars: int, min_exchanges: int, m
     return new_turn_count >= min_exchanges or new_chars >= min_chars
 
 
-# --- Context block update ---
+def _parse_summary_response(raw: str) -> tuple[str | None, str | None]:
+    """Parse the combined JSON response from claude -p into (summary, context).
 
-
-def _build_context_update_prompt(
-    turns: list[Turn],
-    project_name: str,
-    cwd: str,
-    summary: str | None,
-    max_chars: int,
-) -> str:
-    """Build a prompt for claude -p to generate a context block update."""
-    now = datetime.now(UTC).strftime("%Y-%m-%d")
-
-    if summary:
-        source_text = f"--- Session Summary ---\n{summary}"
-    else:
-        source_text = f"--- Transcript ---\n{_format_transcript_for_summary(turns, max_chars)}"
-
-    return f"""Generate a concise "context" memory block for a Claude Code agent's persistent memory.
-
-This block is loaded at the START of the next conversation to orient the agent on what was
-recently worked on. It should be 3-8 lines max. Use this exact format:
-
-Session: {now}. <one-line description of what repo/project was active>
-
-## Previous session recap
-- <2-4 bullet points of what was accomplished>
-
-## Current state
-- <1-2 bullets: what's in progress, what's next, any blockers>
-
-Project: {project_name}
-Working directory: {cwd}
-
-{source_text}
-
-Output ONLY the context block content — no preamble, no markdown fences, no explanation."""
-
-
-def _update_context_block(
-    client: httpx.Client,
-    turns: list[Turn],
-    project_name: str,
-    cwd: str,
-    summary: str | None,
-    summary_config: SummarizationConfig,
-) -> None:
-    """Generate and persist an updated context block via claude -p + cloud API.
-
-    Best-effort: logs warnings on failure but never raises.
+    Handles both clean JSON and JSON wrapped in markdown fences.
+    Returns (summary, context) — either may be None if parsing fails.
     """
-    prompt = _build_context_update_prompt(
-        turns, project_name, cwd, summary, summary_config.max_transcript_chars
-    )
-    context_value = _summarize_with_claude(prompt, summary_config)
-    if not context_value:
-        logger.warning("Context block update failed — claude -p returned nothing")
-        return
+    text = raw.strip()
+    # Strip markdown fences if present
+    if text.startswith("```"):
+        lines = text.split("\n")
+        # Remove first and last lines (```json and ```)
+        lines = [line for line in lines[1:] if not line.strip().startswith("```")]
+        text = "\n".join(lines)
 
     try:
-        resp = client.put("/api/blocks/context", json={"value": context_value})
-        resp.raise_for_status()
-        logger.info("Updated context memory block (%d chars)", len(context_value))
-    except Exception as e:
-        logger.warning("Failed to update context block: %s", e)
+        data = json.loads(text)
+        summary = data.get("summary")
+        context = data.get("context")
+        return (
+            summary if isinstance(summary, str) and summary.strip() else None,
+            context if isinstance(context, str) and context.strip() else None,
+        )
+    except (json.JSONDecodeError, AttributeError):
+        # Fallback: treat entire response as a plain-text summary, no context
+        logger.warning("Failed to parse JSON from claude -p — using raw text as summary")
+        return (text if text else None, None)
 
 
 # --- Passage persistence ---
@@ -565,14 +544,10 @@ def session_start(hook_input: dict[str, Any]) -> None:
 
 
 def stop(hook_input: dict[str, Any]) -> None:
-    """Handle Stop hook: persist turns, optionally summarize, and update context.
+    """Handle Stop hook: persist raw turns only (Layer 1).
 
-    Three-layer persistence:
-      Layer 1: Always persist raw turns as tagged archival passages.
-      Layer 2: When threshold is met, generate and persist an LLM summary.
-               If summarization fails, log error — turns are already safe.
-      Layer 3: Always update the 'context' memory block via claude -p so the
-               next session starts with fresh orientation on recent work.
+    Fires after every assistant turn. Persists new exchanges as individual
+    archival passages tagged "exchange". Cheap HTTP POSTs, no LLM calls.
     """
     if os.environ.get("YAUCCA_SKIP_HOOKS"):
         return
@@ -598,7 +573,7 @@ def stop(hook_input: dict[str, Any]) -> None:
     # Load session state
     state = _load_session_state(session_id)
 
-    # Layer 1: Extract new turns since last persistence
+    # Extract new turns since last persistence
     new_turns, new_chars, total_lines = _extract_turns(
         transcript_path, start_line=state.last_persisted_line_offset
     )
@@ -621,7 +596,7 @@ def stop(hook_input: dict[str, Any]) -> None:
         logger.error("Failed to connect to yaucca cloud: %s", e)
         return
 
-    # Layer 1: Persist raw turns
+    # Persist raw turns
     try:
         _persist_turns(client, new_turns, session_id, project_name)
     except Exception as e:
@@ -635,61 +610,107 @@ def stop(hook_input: dict[str, Any]) -> None:
     state.last_persisted_line_offset = total_lines
     logger.info("Persisted %d raw turns to archival memory", len(new_turns))
 
-    # Layer 2: Check if we should do full summarization
-    summary: str | None = None
-    all_turns: list[Turn] = []
-    summary_config = get_settings().summary
+    # Save session state
+    _save_session_state(state)
 
-    # Extract turns since last summary for threshold check
-    turns_since_summary, chars_since_summary, _ = _extract_turns(
-        transcript_path, start_line=state.last_summary_line_offset
+
+def session_end(hook_input: dict[str, Any]) -> None:
+    """Handle SessionEnd hook: summarize session + update context block (Layers 2+3).
+
+    Fires once when the session actually closes. Generates a single `claude -p`
+    call that produces both an archival summary and a compact context block for
+    the next session's cold start.
+    """
+    if os.environ.get("YAUCCA_SKIP_HOOKS"):
+        return
+
+    transcript_path = hook_input.get("transcript_path", "")
+    logger.info(
+        "SessionEnd hook: keys=%s transcript_exists=%s",
+        list(hook_input.keys()),
+        bool(transcript_path and Path(transcript_path).exists()),
     )
+    if not transcript_path:
+        logger.debug("No transcript_path in hook input")
+        return
 
-    if summary_config.enabled and _should_summarize(
-        len(turns_since_summary), chars_since_summary, summary_config.min_exchanges, summary_config.min_chars
-    ):
-        # Extract ALL turns from start for full-session summary
-        all_turns, _, _ = _extract_turns(transcript_path, start_line=0)
+    session_id = hook_input.get("session_id", "unknown")
+    cwd = hook_input.get("cwd", "")
+    project_name = Path(cwd).name if cwd else "unknown"
 
-        if all_turns:
-            prompt = _build_summary_prompt(
-                all_turns, project_name, cwd, session_id, summary_config.max_transcript_chars
-            )
-            summary = _summarize_with_claude(prompt, summary_config)
+    settings = get_settings()
+    summary_config = settings.summary
+    if not summary_config.enabled:
+        logger.debug("Summarization disabled")
+        return
 
-            if summary:
-                passage_id = _persist_summary(
-                    client,
-                    summary,
-                    state.last_summary_passage_id,
-                    session_id,
-                    project_name,
-                )
-
-                state.last_summary_ts = datetime.now(UTC).isoformat()
-                state.last_summary_exchange_count = len(all_turns)
-                state.last_summary_line_offset = total_lines
-                if passage_id:
-                    state.last_summary_passage_id = passage_id
-
-                logger.info("Persisted LLM-generated session summary (%d turns)", len(all_turns))
-            else:
-                logger.error("Summarization failed — raw turns already persisted")
-
-    # Layer 3: Update the context memory block so the next session starts oriented.
+    # Extract all turns for full-session summary
+    all_turns, _, total_lines = _extract_turns(transcript_path, start_line=0)
     if not all_turns:
-        all_turns, _, _ = _extract_turns(transcript_path, start_line=0)
-    if all_turns:
-        _update_context_block(
+        logger.debug("No turns to summarize")
+        return
+
+    # Check minimum threshold — skip summarization for trivially short sessions
+    if not _should_summarize(
+        len(all_turns), sum(len(t.format()) for t in all_turns),
+        summary_config.min_exchanges, summary_config.min_chars,
+    ):
+        logger.info("Session too short for summarization (%d turns)", len(all_turns))
+        return
+
+    # Connect to cloud API
+    try:
+        client, _ = _cloud_client()
+        client.get("/health").raise_for_status()
+    except Exception as e:
+        if settings.cloud.required:
+            logger.error("FATAL: Cannot summarize (YAUCCA_REQUIRED=true): %s", e)
+            sys.exit(1)
+        logger.error("Failed to connect to yaucca cloud: %s", e)
+        return
+
+    # Single claude -p call for both summary + context block
+    prompt = _build_summary_prompt(
+        all_turns, project_name, cwd, session_id, summary_config.max_transcript_chars
+    )
+    raw_response = _summarize_with_claude(prompt, summary_config)
+
+    if not raw_response:
+        logger.error("Summarization failed — raw turns were already persisted by Stop hook")
+        return
+
+    summary, context_value = _parse_summary_response(raw_response)
+
+    # Load session state for summary passage tracking
+    state = _load_session_state(session_id)
+
+    # Layer 2: Persist the archival summary
+    if summary:
+        passage_id = _persist_summary(
             client,
-            all_turns,
-            project_name,
-            cwd,
             summary,
-            summary_config,
+            state.last_summary_passage_id,
+            session_id,
+            project_name,
         )
 
-    # Save session state (always, even if summarization was skipped/failed)
+        state.last_summary_ts = datetime.now(UTC).isoformat()
+        state.last_summary_exchange_count = len(all_turns)
+        state.last_summary_line_offset = total_lines
+        if passage_id:
+            state.last_summary_passage_id = passage_id
+
+        logger.info("Persisted LLM-generated session summary (%d turns)", len(all_turns))
+
+    # Layer 3: Update the context memory block
+    if context_value:
+        try:
+            resp = client.put("/api/blocks/context", json={"value": context_value})
+            resp.raise_for_status()
+            logger.info("Updated context memory block (%d chars)", len(context_value))
+        except Exception as e:
+            logger.warning("Failed to update context block: %s", e)
+
     _save_session_state(state)
 
 
@@ -742,7 +763,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="yaucca-hooks", description="yaucca Claude Code hooks")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("session_start", help="SessionStart hook")
-    subparsers.add_parser("stop", help="Stop hook")
+    subparsers.add_parser("stop", help="Stop hook (Layer 1: persist raw turns)")
+    subparsers.add_parser("session_end", help="SessionEnd hook (Layers 2+3: summarize + update context)")
     subparsers.add_parser("status", help="Show recent passages and session state")
 
     args = parser.parse_args()
@@ -755,6 +777,8 @@ def main() -> None:
             session_start(hook_input)
         elif args.command == "stop":
             stop(hook_input)
+        elif args.command == "session_end":
+            session_end(hook_input)
 
 
 if __name__ == "__main__":

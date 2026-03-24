@@ -51,8 +51,8 @@ class TestSummarizationConfig:
             config = SummarizationConfig(_env_file=None)
             assert config.enabled is True
             assert config.model == ""
-            assert config.min_exchanges == 3
-            assert config.min_chars == 2000
+            assert config.min_exchanges == 8
+            assert config.min_chars == 10000
             assert config.timeout == 90
             assert config.max_transcript_chars == 100_000
             assert config.claude_command == "claude"
@@ -94,4 +94,4 @@ class TestSettings:
         with patch.dict("os.environ", {}, clear=True):
             settings = Settings(_env_file=None)
             assert settings.summary.enabled is True
-            assert settings.summary.min_exchanges == 3
+            assert settings.summary.min_exchanges == 8

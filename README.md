@@ -86,7 +86,7 @@ EOF
 ### Install hooks
 
 ```bash
-# Install SessionStart + Stop hooks into ~/.claude/settings.json
+# Install SessionStart + Stop + SessionEnd hooks into ~/.claude/settings.json
 uv run python -m yaucca.install
 
 # To uninstall (restores backup):
@@ -96,6 +96,11 @@ uv run python -m yaucca.install --uninstall
 This auto-detects the project directory and creates a backup at
 `~/.claude/settings.json.bak`. Hooks read credentials from the `.env`
 file — no inline env vars needed.
+
+**Hook lifecycle:**
+- **SessionStart**: Injects memory context (core blocks + recent exchanges)
+- **Stop** (every turn): Persists raw exchanges to archival — cheap HTTP POSTs, no LLM calls
+- **SessionEnd** (on exit): Single `claude -p` call generates both an archival summary and an updated context block
 
 The `.mcp.json` in the project root is already configured for the MCP
 server. If you need it globally, copy the `yaucca` entry to

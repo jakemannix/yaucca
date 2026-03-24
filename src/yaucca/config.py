@@ -43,8 +43,8 @@ class SummarizationConfig(BaseSettings):
 
     enabled: bool = Field(default=True, description="Toggle summarization on/off")
     model: str = Field(default="", description="Model for claude -p --model (empty = default)")
-    min_exchanges: int = Field(default=3, description="New exchanges threshold to trigger summarization")
-    min_chars: int = Field(default=2000, description="New chars threshold to trigger summarization")
+    min_exchanges: int = Field(default=8, description="New exchanges threshold to trigger summarization")
+    min_chars: int = Field(default=10000, description="New chars threshold to trigger summarization")
     timeout: int = Field(default=90, description="Seconds for claude -p subprocess")
     max_transcript_chars: int = Field(default=100_000, description="Truncation limit for long transcripts")
     claude_command: str = Field(default="claude", description="Path to claude CLI")

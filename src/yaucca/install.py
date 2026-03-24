@@ -5,14 +5,13 @@ Usage:
     uv run python -m yaucca.install --uninstall  # revert
 
 Reads the yaucca project directory from the location of this file,
-and injects SessionStart/Stop hooks into ~/.claude/settings.json.
+and injects SessionStart/Stop/SessionEnd hooks into ~/.claude/settings.json.
 Preserves all other settings. Creates a backup before modifying.
 """
 
 import argparse
 import json
 import shutil
-import sys
 from pathlib import Path
 
 SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
@@ -48,6 +47,17 @@ def _yaucca_hooks() -> dict:
                     {
                         "type": "command",
                         "command": f"cd {project_dir} && uv run python -m yaucca.hooks stop",
+                        "timeout": 10,
+                    }
+                ],
+            }
+        ],
+        "SessionEnd": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f"cd {project_dir} && uv run python -m yaucca.hooks session_end",
                         "timeout": 120,
                     }
                 ],
@@ -92,7 +102,7 @@ def install() -> None:
     hooks = settings.setdefault("hooks", {})
     new_hooks = _yaucca_hooks()
 
-    for event in ("SessionStart", "Stop"):
+    for event in ("SessionStart", "Stop", "SessionEnd"):
         existing = hooks.get(event, [])
         # Remove any previous yaucca hooks
         filtered = [h for h in existing if not _is_yaucca_hook(h)]
@@ -104,8 +114,9 @@ def install() -> None:
 
     project_dir = _project_dir()
     print(f"Installed yaucca hooks (project: {project_dir})")
-    print(f"  SessionStart: timeout=30s")
-    print(f"  Stop: timeout=120s")
+    print("  SessionStart: timeout=30s")
+    print("  Stop: timeout=10s (raw turn persistence only)")
+    print("  SessionEnd: timeout=120s (summary + context update)")
     print()
 
     # Check .env
@@ -128,7 +139,7 @@ def uninstall() -> None:
 
     hooks = settings.get("hooks", {})
 
-    for event in ("SessionStart", "Stop"):
+    for event in ("SessionStart", "Stop", "SessionEnd"):
         existing = hooks.get(event, [])
         filtered = [h for h in existing if not _is_yaucca_hook(h)]
         if filtered:

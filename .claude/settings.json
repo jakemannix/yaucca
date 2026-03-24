@@ -18,7 +18,18 @@
           {
             "type": "command",
             "command": "uv run python -m yaucca.hooks stop",
-            "timeout": 15
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run python -m yaucca.hooks session_end",
+            "timeout": 120
           }
         ]
       }
