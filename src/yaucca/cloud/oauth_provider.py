@@ -19,7 +19,7 @@ from mcp.server.auth.provider import (
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
 # Token lifetimes
-ACCESS_TOKEN_EXPIRY = 3600  # 1 hour
+ACCESS_TOKEN_EXPIRY = 24 * 3600  # 24 hours
 REFRESH_TOKEN_EXPIRY = 30 * 24 * 3600  # 30 days
 AUTH_CODE_EXPIRY = 600  # 10 minutes
 
