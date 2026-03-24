@@ -20,7 +20,7 @@ image = (
         "pydantic-settings>=2.0.0",
         "sqlite-vec>=0.1.0",
     )
-    .add_local_python_source("yaucca")
+    .add_local_python_source("yaucca")  # v2: added get_passage endpoint
 )
 
 
