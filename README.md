@@ -107,20 +107,24 @@ file — no inline env vars needed.
 **Option A: Remote MCP (recommended)** — Claude.ai, mobile, and Claude Code
 all connect to the same remote MCP server via OAuth 2.1 + GitHub login:
 
-```json
-// .mcp.json
-{
-  "mcpServers": {
-    "yaucca": {
-      "type": "url",
-      "url": "https://jakemannix--yaucca-serve.modal.run/mcp"
-    }
-  }
-}
+```bash
+# Add via CLI (creates the correct .mcp.json entry):
+claude mcp add --transport http -s project yaucca https://jakemannix--yaucca-serve.modal.run/mcp
 ```
 
-On first connect, Claude Code opens a browser for GitHub OAuth. After that,
-the token is cached and refreshed automatically.
+This creates the `.mcp.json` entry with `"type": "http"` (not `"url"`).
+
+**First-time auth:** On first connect, Claude Code will show `! Needs authentication`
+for the yaucca server. To trigger the OAuth flow:
+
+1. Type `/mcp` in the Claude Code prompt
+2. Select the yaucca server → "Authenticate"
+3. Browser opens → GitHub OAuth login → authorize the `yaucca` app
+4. Browser redirects back → "Authentication successful. Connected to yaucca."
+5. All 7 memory tools are now available
+
+The OAuth token is cached and refreshed automatically — you only need to
+authenticate once per device.
 
 **Option B: Stdio proxy (fallback)** — local subprocess proxies to the cloud
 API via HTTP. No OAuth, uses `YAUCCA_AUTH_TOKEN` from `.env`:
@@ -145,8 +149,9 @@ If the remote MCP server breaks, switch back to stdio:
 ```bash
 # 1. Restore the stdio MCP config
 cd /path/to/yaucca
-git checkout HEAD -- .mcp.json
-# Or manually: replace the "type":"url" entry with the "command":"uv" entry above
+claude mcp remove -s project yaucca
+claude mcp add -s project yaucca -- uv run python -m yaucca.mcp_server
+# Or manually: replace the "type":"http" entry with the "command":"uv" entry above
 
 # 2. If hooks are also broken, uninstall them
 uv run python -m yaucca.install --uninstall
