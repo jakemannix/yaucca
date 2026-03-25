@@ -203,10 +203,36 @@ curl -X POST "$YAUCCA_URL/api/admin/backfill?profile=d512" \
 git clone https://github.com/jakemannix/yaucca.git
 cd yaucca
 uv sync --extra dev                # Install all deps (client + server + test)
-uv run pytest                      # Unit tests (114 tests)
+uv run pytest                      # Unit tests (125 tests)
 uv run ruff check . && ruff format .  # Lint + format
 uv run mypy src/yaucca             # Type check
 ```
+
+### Testing the install flow
+
+All commands support `--app-name` to create an isolated instance that
+doesn't touch your production server, database, or config:
+
+```bash
+# Deploy a test instance (separate Modal app, volume, and secrets)
+yaucca-deploy --app-name yaucca-test
+
+# Install against the test instance (separate .env, hooks, MCP entry)
+yaucca-install --app-name yaucca-test
+
+# Or use the wrapper scripts (backup + deploy + install in one step):
+./scripts/setup.sh --app-name yaucca-test
+
+# Tear down (restores your production config from backups):
+./scripts/teardown.sh --app-name yaucca-test
+
+# Fully destroy the test Modal resources (app, volume, secrets):
+./scripts/teardown.sh --app-name yaucca-test --destroy-backend
+```
+
+Note: test instances need their own
+[GitHub OAuth App](https://github.com/settings/developers) with the
+test callback URL (`https://<username>--yaucca-test-serve.modal.run/oauth/github/callback`).
 
 ## License
 
