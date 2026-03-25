@@ -28,6 +28,18 @@ ENV_FILE = CONFIG_DIR / ".env"
 YAUCCA_MARKER = "yaucca.hooks"
 
 
+def _is_cloud_env() -> bool:
+    """Detect if we're running in a Claude Code cloud sandbox.
+
+    Cloud sandboxes run as root on Ubuntu. The entrypoint is "cloudcode"
+    (vs "cli" for local). Falls back to explicit YAUCCA_CLOUD=1.
+    """
+    entrypoint = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "")
+    if entrypoint and entrypoint != "cli":
+        return True
+    return bool(os.environ.get("YAUCCA_CLOUD"))
+
+
 # --- .env management ---
 
 # Set by install()/uninstall() to the active .env path for this run
@@ -256,6 +268,81 @@ def _install_rules_template() -> None:
     print(f"  Installed memory rules at {target}")
 
 
+# --- Repo-level config (for cloud sandboxes) ---
+
+
+def _install_repo_level_hooks(app_name: str = "yaucca") -> None:
+    """Write hooks to .claude/settings.json in the current repo."""
+    repo_settings = Path.cwd() / ".claude" / "settings.json"
+    repo_settings.parent.mkdir(parents=True, exist_ok=True)
+
+    if repo_settings.exists():
+        settings = json.loads(repo_settings.read_text())
+    else:
+        settings = {}
+
+    hooks = settings.setdefault("hooks", {})
+    # Cloud hooks use bare `python -m` (not venv-specific path)
+    new_hooks = _cloud_hooks()
+
+    for event in ("SessionStart", "Stop", "SessionEnd"):
+        existing = hooks.get(event, [])
+        filtered = [h for h in existing if not _is_yaucca_hook(h)]
+        filtered.extend(new_hooks[event])
+        hooks[event] = filtered
+
+    repo_settings.write_text(json.dumps(settings, indent=2) + "\n")
+    print(f"  Wrote repo-level hooks to {repo_settings}")
+
+
+def _cloud_hooks() -> dict:
+    """Build hooks for cloud environments (bare python, no venv path)."""
+    cmd_prefix = "python -m yaucca.hooks"
+    return {
+        "SessionStart": [
+            {
+                "matcher": "startup|resume|compact|clear",
+                "hooks": [{"type": "command", "command": f"{cmd_prefix} session_start", "timeout": 30}],
+            }
+        ],
+        "Stop": [
+            {"hooks": [{"type": "command", "command": f"{cmd_prefix} stop", "timeout": 10}]}
+        ],
+        "SessionEnd": [
+            {"hooks": [{"type": "command", "command": f"{cmd_prefix} session_end", "timeout": 120}]}
+        ],
+    }
+
+
+def _install_repo_level_mcp(app_name: str = "yaucca") -> None:
+    """Write .mcp.json with bearer token auth to the current repo."""
+    url = _get_env("YAUCCA_URL")
+    if not url:
+        url = os.environ.get("YAUCCA_URL", "")
+    if not url:
+        print("  WARNING: YAUCCA_URL not set — skipping repo-level .mcp.json")
+        return
+
+    mcp_json = Path.cwd() / ".mcp.json"
+    config = {}
+    if mcp_json.exists():
+        try:
+            config = json.loads(mcp_json.read_text())
+        except json.JSONDecodeError:
+            pass
+
+    servers = config.setdefault("mcpServers", {})
+    servers[app_name] = {
+        "type": "http",
+        "url": f"{url.rstrip('/')}/mcp",
+        "headers": {
+            "Authorization": "Bearer ${YAUCCA_AUTH_TOKEN}",
+        },
+    }
+    mcp_json.write_text(json.dumps(config, indent=2) + "\n")
+    print(f"  Wrote repo-level MCP config to {mcp_json}")
+
+
 # --- MCP server ---
 
 
@@ -302,6 +389,10 @@ def _install_mcp_server(app_name: str = "yaucca") -> None:
 def _check_prerequisites() -> None:
     """Check that required tools are available."""
     import sys
+
+    if _is_cloud_env():
+        # Cloud sandboxes use pip, not uv, and claude CLI may not be in PATH
+        return
 
     # Check we're running under uv (or at least not system python)
     python = sys.executable
@@ -372,24 +463,33 @@ def install(user_block: str | None = None, app_name: str = "yaucca") -> None:
             print("  Skipped — user block will start empty.")
     print()
 
+    # Detect environment
+    cloud = _is_cloud_env()
+    if cloud:
+        print(f"  Detected cloud sandbox — using repo-level config")
+        print()
+
     # Step 2: Install hooks
     print("[2/4] Hooks")
-    settings = _load_settings()
-    backup = _backup_settings()
-    if backup:
-        print(f"  Backed up settings to {backup}")
+    if cloud:
+        _install_repo_level_hooks(app_name)
+    else:
+        settings = _load_settings()
+        backup = _backup_settings()
+        if backup:
+            print(f"  Backed up settings to {backup}")
 
-    hooks = settings.setdefault("hooks", {})
-    new_hooks = _yaucca_hooks(app_name)
+        hooks = settings.setdefault("hooks", {})
+        new_hooks = _yaucca_hooks(app_name)
 
-    for event in ("SessionStart", "Stop", "SessionEnd"):
-        existing = hooks.get(event, [])
-        filtered = [h for h in existing if not _is_yaucca_hook(h)]
-        filtered.extend(new_hooks[event])
-        hooks[event] = filtered
+        for event in ("SessionStart", "Stop", "SessionEnd"):
+            existing = hooks.get(event, [])
+            filtered = [h for h in existing if not _is_yaucca_hook(h)]
+            filtered.extend(new_hooks[event])
+            hooks[event] = filtered
 
-    _save_settings(settings)
-    print("  Installed hooks (SessionStart, Stop, SessionEnd)")
+        _save_settings(settings)
+        print("  Installed hooks (SessionStart, Stop, SessionEnd)")
     print()
 
     # Step 3: Memory rules
@@ -399,11 +499,18 @@ def install(user_block: str | None = None, app_name: str = "yaucca") -> None:
 
     # Step 4: MCP server
     print("[4/4] MCP server")
-    _install_mcp_server(app_name)
+    if cloud:
+        _install_repo_level_mcp(app_name)
+    else:
+        _install_mcp_server(app_name)
     print()
 
     print("=== Done! ===")
-    print("Start Claude Code and type /mcp to authenticate the yaucca MCP server.")
+    if cloud:
+        print("Hooks and MCP configured for cloud environment.")
+        print("MCP uses bearer token auth via YAUCCA_AUTH_TOKEN env var.")
+    else:
+        print("Start Claude Code and type /mcp to authenticate the yaucca MCP server.")
 
 
 def uninstall(app_name: str = "yaucca") -> None:
