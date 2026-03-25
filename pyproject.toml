@@ -1,6 +1,6 @@
 [project]
 name = "yaucca"
-version = "0.2.0"
+version = "0.3.0"
 description = "Persistent long-term memory for Claude Code — cloud-native with SQLite + Modal"
 readme = "README.md"
 license = { text = "Apache-2.0" }
