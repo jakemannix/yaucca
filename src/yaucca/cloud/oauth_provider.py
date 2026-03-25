@@ -355,6 +355,18 @@ class YauccaOAuthProvider(OAuthAuthorizationServerProvider):
         )
 
     async def load_access_token(self, token: str) -> AccessToken | None:
+        # Allow direct bearer token auth (for Claude Code cloud sandboxes
+        # where OAuth flows can't complete). The token must match
+        # YAUCCA_AUTH_TOKEN from the environment.
+        import os
+
+        static_token = os.environ.get("YAUCCA_AUTH_TOKEN")
+        if static_token and token == static_token:
+            return AccessToken(
+                token=token,
+                client_id="bearer-auth",
+                scopes=["memory:read", "memory:write"],
+            )
         return self._store.load_access_token(token)
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
