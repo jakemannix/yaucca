@@ -46,6 +46,7 @@ dev = [
 ]
 
 [project.scripts]
+yaucca-deploy = "yaucca.deploy:main"
 yaucca-install = "yaucca.install:main"
 yaucca-deploy-secrets = "yaucca.deploy_secrets:main"
 
