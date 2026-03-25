@@ -234,6 +234,28 @@ Note: test instances need their own
 [GitHub OAuth App](https://github.com/settings/developers) with the
 test callback URL (`https://<username>--yaucca-test-serve.modal.run/oauth/github/callback`).
 
+### Releasing to PyPI
+
+Releases use GitHub Actions with
+[trusted publishing](https://docs.pypi.org/trusted-publishers/) (no API tokens needed).
+
+```bash
+# 1. Bump the version in pyproject.toml
+#    version = "0.3.0"
+
+# 2. Commit, tag, and push
+git add pyproject.toml
+git commit -m "Bump version to 0.3.0"
+git tag v0.3.0
+git push && git push --tags
+
+# 3. Create a GitHub release from the tag
+gh release create v0.3.0 --generate-notes
+```
+
+The `publish.yml` workflow triggers on the release, builds with `uv build`,
+and publishes via OIDC to PyPI.
+
 ## License
 
 [Apache-2.0](LICENSE)
