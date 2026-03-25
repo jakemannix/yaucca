@@ -161,7 +161,9 @@ class TestMCPEndpoint:
         assert "list_memory_blocks" in tool_names
         assert "search_archival_memory" in tool_names
         assert "get_passages" in tool_names
-        assert len(tool_names) == 7
+        assert "list_passages_by_tag" in tool_names
+        assert "update_passage_tags" in tool_names
+        assert len(tool_names) == 9
 
         # Call list_memory_blocks
         call_resp = client.post("/mcp", json={

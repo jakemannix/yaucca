@@ -116,7 +116,10 @@ def create_remote_mcp(
             text = p.text
             if max_chars and len(text) > max_chars:
                 text = text[:max_chars] + f"... [{len(p.text)} chars total]"
-            entries.append({"text": text, "id": p.id})
+            entry: dict[str, object] = {"text": text, "id": p.id}
+            if p.tags:
+                entry["tags"] = p.tags
+            entries.append(entry)
         return str(entries)
 
     @mcp.tool()
@@ -146,20 +149,27 @@ def create_remote_mcp(
                 text = text[offset:]
             if max_chars and len(text) > max_chars:
                 text = text[:max_chars] + f"... [{total} chars total]"
-            results.append({"id": passage.id, "text": text, "total_chars": total})
+            entry: dict[str, object] = {"id": passage.id, "text": text, "total_chars": total}
+            if passage.tags:
+                entry["tags"] = passage.tags
+            results.append(entry)
         return str(results)
 
     @mcp.tool()
-    async def insert_archival_memory(text: str) -> str:
+    async def insert_archival_memory(text: str, tags: list[str] | None = None) -> str:
         """Store a new entry in archival memory.
 
         Use this for experiences, learnings, and insights that don't fit in core memory blocks.
         Entries are embedded for later semantic search.
+
+        Args:
+            text: The content to store.
+            tags: Optional tags for classification (e.g. ["@inbox", "project:foo"]).
         """
         from yaucca.cloud.server import _get_db, _get_embed_queue
 
         db = _get_db()
-        passage = db.create_passage(text=text)
+        passage = db.create_passage(text=text, tags=tags)
         # Queue async embedding (same pattern as the REST API)
         try:
             eq = _get_embed_queue()
@@ -175,6 +185,49 @@ def create_remote_mcp(
 
         blocks = _get_db().list_blocks()
         return str([{"label": b.label, "value_length": len(b.value)} for b in blocks])
+
+    @mcp.tool()
+    async def list_passages_by_tag(tag: str, limit: int = 50) -> str:
+        """List archival passages that have a specific tag.
+
+        Useful for retrieving all items with a given classification,
+        e.g. all "@inbox" items, all "@next" actions, or all items
+        in a project ("project:yaucca-v3").
+
+        Args:
+            tag: The tag to filter by (e.g. "@inbox", "@next", "project:foo").
+            limit: Max number of results (default 50).
+        """
+        from yaucca.cloud.server import _get_db
+
+        passages = _get_db().list_passages(tag=tag, limit=limit)
+        results = []
+        for p in passages:
+            entry: dict[str, object] = {"id": p.id, "text": p.text, "tags": p.tags}
+            if p.created_at:
+                entry["created_at"] = p.created_at
+            results.append(entry)
+        return str(results)
+
+    @mcp.tool()
+    async def update_passage_tags(passage_id: str, tags: list[str]) -> str:
+        """Update the tags on an existing archival passage.
+
+        Replaces all tags on the passage. Read current tags first if you
+        need to add/remove individual tags.
+
+        Args:
+            passage_id: The passage ID to update.
+            tags: The new complete list of tags.
+        """
+        from yaucca.cloud.server import _get_db
+
+        db = _get_db()
+        passage = db.get_passage(passage_id)
+        if not passage:
+            return f"Passage '{passage_id}' not found"
+        db.update_passage_tags(passage_id, tags)
+        return f"Updated tags on passage '{passage_id}'"
 
     @mcp.tool()
     async def get_recent_messages(count: int = 10) -> str:

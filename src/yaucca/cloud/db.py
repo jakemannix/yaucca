@@ -276,6 +276,17 @@ class Database:
             self._notify_write()
         return deleted
 
+    def update_passage_tags(self, passage_id: str, tags: list[str]) -> bool:
+        cursor = self.conn.execute(
+            "UPDATE passages SET tags = ? WHERE id = ?",
+            (json.dumps(tags), passage_id),
+        )
+        self.conn.commit()
+        updated = cursor.rowcount > 0
+        if updated:
+            self._notify_write()
+        return updated
+
     def list_passages(
         self,
         tag: str | None = None,
