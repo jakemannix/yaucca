@@ -136,6 +136,7 @@ class TestHooksInstallUninstall:
              patch.multiple(inst, **patches), \
              patch.object(inst, "_active_env_file", prod_env), \
              patch.object(inst, "_check_prerequisites"), \
+             patch.object(inst, "_is_cloud_env", return_value=False), \
              patch.object(inst, "_seed_user_block_interactive", return_value=None), \
              patch.object(inst, "_check_user_block", return_value=None), \
              patch("subprocess.run", return_value=MagicMock(returncode=1, stdout="", stderr="")):
@@ -153,6 +154,10 @@ class TestHooksInstallUninstall:
             commands = [h["command"] for g in hook_groups for h in g["hooks"]]
             assert any("yaucca.hooks" in cmd for cmd in commands), f"No yaucca hook in {event}"
 
+        # Verify MCP tools are auto-approved
+        assert "permissions" in settings
+        assert "mcp__yaucca" in settings["permissions"]["allow"]
+
     def test_install_preserves_existing_settings(self, fake_home: Path, prod_env: Path) -> None:
         import yaucca.install as inst
 
@@ -163,6 +168,7 @@ class TestHooksInstallUninstall:
              patch.multiple(inst, **patches), \
              patch.object(inst, "_active_env_file", prod_env), \
              patch.object(inst, "_check_prerequisites"), \
+             patch.object(inst, "_is_cloud_env", return_value=False), \
              patch.object(inst, "_seed_user_block_interactive", return_value=None), \
              patch.object(inst, "_check_user_block", return_value=None), \
              patch("subprocess.run", return_value=MagicMock(returncode=1, stdout="", stderr="")):
@@ -182,6 +188,7 @@ class TestHooksInstallUninstall:
              patch.multiple(inst, **patches), \
              patch.object(inst, "_active_env_file", prod_env), \
              patch.object(inst, "_check_prerequisites"), \
+             patch.object(inst, "_is_cloud_env", return_value=False), \
              patch.object(inst, "_seed_user_block_interactive", return_value=None), \
              patch.object(inst, "_check_user_block", return_value=None), \
              patch("subprocess.run", return_value=MagicMock(returncode=1, stdout="", stderr="")):
@@ -212,6 +219,7 @@ class TestHooksInstallUninstall:
              patch.multiple(inst, **patches), \
              patch.object(inst, "_active_env_file", prod_env), \
              patch.object(inst, "_check_prerequisites"), \
+             patch.object(inst, "_is_cloud_env", return_value=False), \
              patch.object(inst, "_seed_user_block_interactive", return_value=None), \
              patch.object(inst, "_check_user_block", return_value=None), \
              patch("subprocess.run", return_value=MagicMock(returncode=1, stdout="", stderr="")):
@@ -236,6 +244,7 @@ class TestMemoryRulesTemplate:
              patch.multiple(inst, **patches), \
              patch.object(inst, "_active_env_file", prod_env), \
              patch.object(inst, "_check_prerequisites"), \
+             patch.object(inst, "_is_cloud_env", return_value=False), \
              patch.object(inst, "_seed_user_block_interactive", return_value=None), \
              patch.object(inst, "_check_user_block", return_value=None), \
              patch("subprocess.run", return_value=MagicMock(returncode=1, stdout="", stderr="")):
@@ -257,6 +266,7 @@ class TestMemoryRulesTemplate:
              patch.multiple(inst, **patches), \
              patch.object(inst, "_active_env_file", prod_env), \
              patch.object(inst, "_check_prerequisites"), \
+             patch.object(inst, "_is_cloud_env", return_value=False), \
              patch.object(inst, "_seed_user_block_interactive", return_value=None), \
              patch.object(inst, "_check_user_block", return_value=None), \
              patch("subprocess.run", return_value=MagicMock(returncode=1, stdout="", stderr="")):
@@ -283,6 +293,7 @@ class TestMemoryRulesTemplate:
              patch.multiple(inst, **patches), \
              patch.object(inst, "_active_env_file", prod_env), \
              patch.object(inst, "_check_prerequisites"), \
+             patch.object(inst, "_is_cloud_env", return_value=False), \
              patch.object(inst, "_seed_user_block_interactive", return_value=None), \
              patch.object(inst, "_check_user_block", return_value=None), \
              patch("subprocess.run", return_value=MagicMock(returncode=1, stdout="", stderr="")):
@@ -306,6 +317,7 @@ class TestHookPythonPath:
              patch.multiple(inst, **patches), \
              patch.object(inst, "_active_env_file", prod_env), \
              patch.object(inst, "_check_prerequisites"), \
+             patch.object(inst, "_is_cloud_env", return_value=False), \
              patch.object(inst, "_seed_user_block_interactive", return_value=None), \
              patch.object(inst, "_check_user_block", return_value=None), \
              patch("subprocess.run", return_value=MagicMock(returncode=1, stdout="", stderr="")):
@@ -332,6 +344,7 @@ class TestAppNameIsolation:
         with _patch_home(fake_home), \
              patch.multiple(inst, **patches), \
              patch.object(inst, "_check_prerequisites"), \
+             patch.object(inst, "_is_cloud_env", return_value=False), \
              patch.object(inst, "_seed_user_block_interactive", return_value=None), \
              patch.object(inst, "_check_user_block", return_value=None), \
              patch("subprocess.run", return_value=MagicMock(returncode=1, stdout="", stderr="")):
@@ -346,6 +359,7 @@ class TestAppNameIsolation:
         with _patch_home(fake_home), \
              patch.multiple(inst, **patches), \
              patch.object(inst, "_check_prerequisites"), \
+             patch.object(inst, "_is_cloud_env", return_value=False), \
              patch.object(inst, "_seed_user_block_interactive", return_value=None), \
              patch.object(inst, "_check_user_block", return_value=None), \
              patch("subprocess.run", return_value=MagicMock(returncode=1, stdout="", stderr="")):
@@ -418,6 +432,7 @@ class TestFullRoundTrip:
              patch.multiple(inst, **patches), \
              patch.object(inst, "_active_env_file", prod_env), \
              patch.object(inst, "_check_prerequisites"), \
+             patch.object(inst, "_is_cloud_env", return_value=False), \
              patch.object(inst, "_seed_user_block_interactive", return_value=None), \
              patch.object(inst, "_check_user_block", return_value=None), \
              patch("subprocess.run", return_value=MagicMock(returncode=1, stdout="", stderr="")):

@@ -291,8 +291,16 @@ def _install_repo_level_hooks(app_name: str = "yaucca") -> None:
         filtered.extend(new_hooks[event])
         hooks[event] = filtered
 
+    # Auto-approve MCP tools
+    perms = settings.setdefault("permissions", {})
+    allow = perms.setdefault("allow", [])
+    mcp_perm = f"mcp__{app_name}"
+    if mcp_perm not in allow:
+        allow.append(mcp_perm)
+
     repo_settings.write_text(json.dumps(settings, indent=2) + "\n")
     print(f"  Wrote repo-level hooks to {repo_settings}")
+    print(f"  Auto-approved MCP tools ({mcp_perm})")
 
 
 def _cloud_hooks() -> dict:
@@ -469,8 +477,9 @@ def install(user_block: str | None = None, app_name: str = "yaucca") -> None:
         print(f"  Detected cloud sandbox — using repo-level config")
         print()
 
-    # Step 2: Install hooks
-    print("[2/4] Hooks")
+    # Step 2: Install hooks + permissions
+    print("[2/4] Hooks + permissions")
+    mcp_perm = f"mcp__{app_name}"
     if cloud:
         _install_repo_level_hooks(app_name)
     else:
@@ -488,8 +497,15 @@ def install(user_block: str | None = None, app_name: str = "yaucca") -> None:
             filtered.extend(new_hooks[event])
             hooks[event] = filtered
 
+        # Auto-approve MCP tools
+        perms = settings.setdefault("permissions", {})
+        allow = perms.setdefault("allow", [])
+        if mcp_perm not in allow:
+            allow.append(mcp_perm)
+
         _save_settings(settings)
         print("  Installed hooks (SessionStart, Stop, SessionEnd)")
+        print(f"  Auto-approved MCP tools ({mcp_perm})")
     print()
 
     # Step 3: Memory rules
