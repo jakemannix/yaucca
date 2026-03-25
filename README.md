@@ -76,35 +76,24 @@ and Claude mobile (phone).
 ```bash
 uv pip install yaucca[deploy]
 
-# Authenticate with Modal
-modal setup
-
-# Create a GitHub OAuth App at https://github.com/settings/developers
-#   Homepage URL: https://<your-modal-username>--yaucca-serve.modal.run
-#   Callback URL: https://<your-modal-username>--yaucca-serve.modal.run/oauth/github/callback
-
-# Generate an auth token
-export YAUCCA_AUTH_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
-echo "Save this: YAUCCA_AUTH_TOKEN=$YAUCCA_AUTH_TOKEN"
-
-# Create .env
-cat > .env << EOF
-YAUCCA_URL=https://<your-modal-username>--yaucca-serve.modal.run
-YAUCCA_AUTH_TOKEN=$YAUCCA_AUTH_TOKEN
-OPENROUTER_API_KEY=<your-openrouter-key>
-YAUCCA_ISSUER_URL=https://<your-modal-username>--yaucca-serve.modal.run
-GITHUB_CLIENT_ID=<from-github-oauth-app>
-GITHUB_CLIENT_SECRET=<from-github-oauth-app>
-GITHUB_ALLOWED_USERS=<your-github-username>
-EOF
-
-# Push secrets to Modal and deploy
-yaucca-deploy-secrets
-modal deploy src/yaucca/cloud/modal_app.py
-
-# Verify
-curl https://<your-modal-username>--yaucca-serve.modal.run/health
+# Guided setup: checks Modal, shows GitHub OAuth instructions,
+# creates ~/.config/yaucca/.env, deploys to Modal
+yaucca-deploy
 ```
+
+`yaucca-deploy` walks you through each step:
+
+1. **Modal account** — checks you're logged in (run `modal setup` if not)
+2. **Server URL** — computed from your Modal username
+3. **GitHub OAuth App** — tells you exactly what to fill in at
+   https://github.com/settings/developers (Homepage URL, Callback URL)
+4. **Configuration** — creates `~/.config/yaucca/.env` with your auth token
+   pre-generated and placeholders for the keys you need to paste in
+5. **Deploy** — pushes secrets to Modal and deploys (only after `.env` is complete)
+
+First run will pause at step 4 and ask you to edit `~/.config/yaucca/.env`
+with your OpenRouter API key and GitHub OAuth credentials. Fill those in,
+then re-run `yaucca-deploy` to finish.
 
 ### Step 2: Use it everywhere
 
@@ -113,62 +102,35 @@ On every machine or cloud environment where you use Claude Code:
 ```bash
 uv pip install yaucca
 
-# Install hooks + memory rules template
+# Interactive setup: seeds your user profile, installs hooks + memory
+# rules, adds the remote MCP server
 yaucca-install
-
-# Add the remote MCP server
-claude mcp add --transport http -s user yaucca \
-  https://<your-modal-username>--yaucca-serve.modal.run/mcp
 ```
 
-`yaucca-install` does three things:
+`yaucca-install` does four things:
 
-1. **Hooks** → added to `~/.claude/settings.json` (SessionStart, Stop,
+1. **User profile** → interactively asks your name, role, etc. and seeds
+   the `user` memory block on the server (skips if already seeded; use
+   `--user-block "..."` to skip the interactive prompt)
+2. **Hooks** → added to `~/.claude/settings.json` (SessionStart, Stop,
    SessionEnd — see [Hook lifecycle](#hook-lifecycle) below)
-2. **Memory rules** → installed at `~/.claude/rules/yaucca-memory.md` —
+3. **Memory rules** → installed at `~/.claude/rules/yaucca-memory.md` —
    teaches Claude how to use the memory blocks (read-modify-write, hygiene,
    when to update each block). Edit this file to customize.
-3. **`.env` check** → warns if `YAUCCA_URL` / `YAUCCA_AUTH_TOKEN` aren't
-   configured
+4. **MCP server** → runs `claude mcp add` to register the remote MCP server
 
-First-time MCP auth:
-
-1. Type `/mcp` in Claude Code
-2. Select yaucca → browser opens → GitHub login → authorize
-3. All 7 memory tools are now available (token auto-refreshes)
+**First-time MCP auth:** after install, start Claude Code and type `/mcp`
+→ select yaucca → browser opens for GitHub login → authorize → connected.
+Token auto-refreshes after that.
 
 **Claude.ai web / mobile:** Settings → Integrations → Add custom
-integration → paste `https://<your-modal-username>--yaucca-serve.modal.run/mcp`
-→ GitHub OAuth. No hooks on these surfaces — use MCP tools directly, or
-add instructions to your Claude.ai project to call them.
+integration → paste your server URL `/mcp` → GitHub OAuth.
 
-**Claude Code cloud environments:** Add to your setup script:
+**Claude Code cloud environments:** Set `YAUCCA_URL` + `YAUCCA_AUTH_TOKEN`
+as environment variables, then add to your setup script:
 
 ```bash
 uv pip install yaucca && yaucca-install
-```
-
-Set `YAUCCA_URL` + `YAUCCA_AUTH_TOKEN` as environment variables in the
-cloud environment config.
-
-### First session — seeding memory
-
-On your first session, memory blocks are empty. Claude will start populating
-them as you work — the memory rules template guides it on what goes where.
-You can also seed blocks manually via the MCP tools:
-
-```
-> Use the yaucca tools to update the "user" block with: "Name: ..."
-> Update the "projects" block with my current active projects.
-```
-
-Or via the REST API:
-
-```bash
-curl -X PUT "$YAUCCA_URL/api/blocks/user" \
-  -H "Authorization: Bearer $YAUCCA_AUTH_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"value": "Name: Your Name\nRole: ..."}'
 ```
 
 ### Hook lifecycle
