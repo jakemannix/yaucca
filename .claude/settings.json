@@ -1,4 +1,9 @@
 {
+  "permissions": {
+    "allow": [
+      "mcp__yaucca"
+    ]
+  },
   "hooks": {
     "SessionStart": [
       {
