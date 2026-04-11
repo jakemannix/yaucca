@@ -514,12 +514,27 @@ def _write_rules_file() -> None:
     summaries = [p for p in all_passages if "summary" in p.tags]
     other = [p for p in all_passages if p not in exchanges and p not in summaries]
 
+    # Fetch configurable tagged sections (e.g. @next, @inbox)
+    tagged_sections: dict[str, list[Any]] = {}
+    sessionstart_tags = os.environ.get("YAUCCA_SESSIONSTART_TAGS", "")
+    for tag in [t.strip() for t in sessionstart_tags.split(",") if t.strip()]:
+        try:
+            resp = client.get("/api/passages", params={"tag": tag, "limit": 50, "order": "desc"})
+            resp.raise_for_status()
+            tag_body = resp.json()
+            tag_passages = tag_body["passages"] if isinstance(tag_body, dict) and "passages" in tag_body else tag_body
+            if tag_passages:
+                tagged_sections[tag] = [_PassageLike(p) for p in tag_passages]
+        except Exception:
+            pass  # Non-fatal: skip this tag section if it fails
+
     context = render_full_context(
         blocks=blocks,
         exchanges=exchanges,
         summaries=summaries + other,
         archival_count=len(all_passages),
         exchange_count=len(exchanges),
+        tagged_sections=tagged_sections or None,
     )
 
     RULES_CONTEXT_FILE.parent.mkdir(parents=True, exist_ok=True)

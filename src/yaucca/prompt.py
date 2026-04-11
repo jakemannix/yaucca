@@ -167,24 +167,58 @@ def render_archival_summaries(summaries: list[Any], max_chars: int | None = None
     return header + body + footer
 
 
+def render_tagged_section(tag: str, passages: list[Any], max_chars: int = 20_000) -> str:
+    """Render a section of passages filtered by tag.
+
+    Used for configurable SessionStart sections (e.g. @next items, @inbox items).
+
+    Args:
+        tag: The tag name (used as section header).
+        passages: Passage-like objects with .text, .tags, .created_at.
+        max_chars: Character budget for this section.
+    """
+    if not passages:
+        return ""
+
+    header = f"<tagged_items tag=\"{tag}\">\n"
+    footer = "\n</tagged_items>"
+    budget = max_chars - len(header) - len(footer) - 100
+
+    lines = []
+    for p in passages:
+        text = p.text.strip()
+        tags = p.tags if hasattr(p, "tags") else []
+        due = next((t for t in tags if t.startswith("due:")), None)
+        line = f"- {text}"
+        if due:
+            line += f" ({due})"
+        if len("\n".join(lines) + "\n" + line) > budget:
+            lines.append(f"[... {len(passages) - len(lines)} more items ...]")
+            break
+        lines.append(line)
+
+    return header + "\n".join(lines) + footer
+
+
 def render_full_context(
     blocks: list[Any],
     exchanges: list[Any],
     summaries: list[Any],
     archival_count: int,
     exchange_count: int,
+    tagged_sections: dict[str, list[Any]] | None = None,
     max_output_chars: int = MAX_OUTPUT_CHARS,
 ) -> str:
     """Render the complete memory context for injection into Claude Code.
 
-    Combines memory blocks, metadata, conversation history, and archival
-    summaries into a single string suitable for additionalContext output
-    from a SessionStart hook.
+    Combines memory blocks, metadata, conversation history, archival
+    summaries, and tagged sections into a single string for the rules file.
 
-    Budget strategy (to stay under max_output_chars for inline injection):
+    Budget strategy (to stay under max_output_chars):
     1. Memory blocks + metadata — always included (small, essential)
-    2. Conversation history — fill remaining budget with most recent exchanges
-    3. Archival summaries — fill any leftover budget
+    2. Tagged sections — configurable, surfaced items (e.g. @next, @inbox)
+    3. Conversation history — fill remaining budget with most recent exchanges
+    4. Archival summaries — fill any leftover budget
     """
     memory_blocks_section = render_memory_blocks(blocks)
     memory_metadata_section = render_memory_metadata(archival_count, exchange_count)
@@ -193,16 +227,26 @@ def render_full_context(
     fixed = memory_blocks_section + "\n\n" + memory_metadata_section + "\n\n"
     remaining = max_output_chars - len(fixed)
 
+    # Tagged sections get budget before conversation history
+    tag_sections_text = ""
+    if tagged_sections:
+        per_section_budget = min(20_000, remaining // (len(tagged_sections) + 2))
+        for tag, passages in tagged_sections.items():
+            section = render_tagged_section(tag, passages, max_chars=per_section_budget)
+            if section:
+                tag_sections_text += section + "\n\n"
+        remaining -= len(tag_sections_text)
+
     # Conversation history gets priority over archival summaries.
-    # Render with the most recent exchanges, trimming older ones to fit.
     conversation_section = render_conversation_history(exchanges, max_chars=max(remaining - 2000, 0))
     remaining -= len(conversation_section) + 2  # +2 for "\n\n"
 
     archival_section = render_archival_summaries(summaries, max_chars=max(remaining, 0))
 
-    return (
-        fixed
-        + conversation_section
-        + "\n\n"
-        + archival_section
-    )
+    parts = [fixed]
+    if tag_sections_text:
+        parts.append(tag_sections_text)
+    parts.append(conversation_section)
+    parts.append(archival_section)
+
+    return "\n\n".join(parts)

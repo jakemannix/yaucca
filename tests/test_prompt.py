@@ -11,6 +11,7 @@ from yaucca.prompt import (
     render_full_context,
     render_memory_blocks,
     render_memory_metadata,
+    render_tagged_section,
 )
 
 
@@ -133,6 +134,30 @@ class TestRenderArchivalSummaries:
         assert "No archival memories found" in result
 
 
+class TestRenderTaggedSection:
+    def test_renders_items(self) -> None:
+        passages = [
+            make_exchange_passage(passage_id="p1", user="Buy groceries", assistant=""),
+            make_exchange_passage(passage_id="p2", user="Fix bike", assistant=""),
+        ]
+        result = render_tagged_section("@next", passages)
+        assert '<tagged_items tag="@next">' in result
+        assert "</tagged_items>" in result
+        assert "Buy groceries" in result
+        assert "Fix bike" in result
+
+    def test_empty_passages(self) -> None:
+        result = render_tagged_section("@inbox", [])
+        assert result == ""
+
+    def test_shows_due_date(self) -> None:
+        from tests.conftest import MockPassage
+
+        passages = [MockPassage(text="Water heater", tags=["@next", "due:2026-04-12"])]
+        result = render_tagged_section("@next", passages)
+        assert "due:2026-04-12" in result
+
+
 class TestRenderFullContext:
     def test_combines_all_sections(self) -> None:
         blocks = make_coding_block_set()
@@ -151,3 +176,23 @@ class TestRenderFullContext:
         assert "<memory_metadata>" in result
         assert "<conversation_history>" in result
         assert "<archival_memory>" in result
+
+    def test_with_tagged_sections(self) -> None:
+        from tests.conftest import MockPassage
+
+        blocks = make_coding_block_set()
+        exchanges = [make_exchange_passage()]
+        summaries = [make_summary_passage()]
+        tagged = {"@next": [MockPassage(text="Buy groceries", tags=["@next"])]}
+
+        result = render_full_context(
+            blocks=blocks,
+            exchanges=exchanges,
+            summaries=summaries,
+            archival_count=5,
+            exchange_count=1,
+            tagged_sections=tagged,
+        )
+
+        assert '<tagged_items tag="@next">' in result
+        assert "Buy groceries" in result
