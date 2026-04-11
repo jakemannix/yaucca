@@ -73,14 +73,14 @@ class TestPassageEndpoints:
         client.post("/api/passages", json={"text": "Second"})
         resp = client.get("/api/passages")
         assert resp.status_code == 200
-        assert len(resp.json()) == 2
+        assert len(resp.json()["passages"]) == 2
 
     def test_list_passages_by_tag(self, client: TestClient) -> None:
         client.post("/api/passages", json={"text": "Ex", "tags": ["exchange"]})
         client.post("/api/passages", json={"text": "Sum", "tags": ["summary"]})
         resp = client.get("/api/passages", params={"tag": "exchange"})
         assert resp.status_code == 200
-        passages = resp.json()
+        passages = resp.json()["passages"]
         assert len(passages) == 1
         assert passages[0]["text"] == "Ex"
 
@@ -92,7 +92,7 @@ class TestPassageEndpoints:
 
         # Verify it's gone
         resp = client.get("/api/passages")
-        assert len(resp.json()) == 0
+        assert len(resp.json()["passages"]) == 0
 
     def test_delete_passage_not_found(self, client: TestClient) -> None:
         resp = client.delete("/api/passages/nonexistent")
@@ -113,9 +113,29 @@ class TestPassageEndpoints:
         client.post("/api/passages", json={"text": "Updated README"})
         resp = client.get("/api/passages", params={"search": "authentication"})
         assert resp.status_code == 200
-        results = resp.json()
+        results = resp.json()["passages"]
         assert len(results) == 1
         assert "authentication" in results[0]["text"]
+
+    def test_exclude_tags(self, client: TestClient) -> None:
+        """Passages with excluded tags are filtered out."""
+        client.post("/api/passages", json={"text": "Active", "tags": ["@next"]})
+        client.post("/api/passages", json={"text": "Done", "tags": ["@next", "@done"]})
+        resp = client.get("/api/passages", params={"tag": "@next", "exclude_tags": "@done"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["passages"]) == 1
+        assert data["passages"][0]["text"] == "Active"
+        assert data["excluded_tags"] == ["@done"]
+
+    def test_exclude_tags_empty_override(self, client: TestClient) -> None:
+        """Passing empty exclude_tags overrides server default."""
+        client.post("/api/passages", json={"text": "Active", "tags": ["@next"]})
+        client.post("/api/passages", json={"text": "Done", "tags": ["@next", "@done"]})
+        # Empty string = no exclusions (override any server default)
+        resp = client.get("/api/passages", params={"tag": "@next", "exclude_tags": ""})
+        assert resp.status_code == 200
+        assert len(resp.json()["passages"]) == 2
 
 
 class TestBackfillEndpoint:

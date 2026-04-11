@@ -72,6 +72,20 @@ def _verify_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def _resolve_exclude_tags(explicit: str | None) -> list[str]:
+    """Resolve exclude_tags: use explicit value if given, else server default.
+
+    Args:
+        explicit: Comma-separated tags from the request, or None for default.
+    Returns:
+        List of tags to exclude (may be empty).
+    """
+    if explicit is not None:
+        return [t.strip() for t in explicit.split(",") if t.strip()]
+    default = os.environ.get("YAUCCA_DEFAULT_EXCLUDE_TAGS", "")
+    return [t.strip() for t in default.split(",") if t.strip()]
+
+
 # --- App factory ---
 
 
@@ -208,19 +222,26 @@ def create_app(
         search: str | None = None,
         limit: int = 50,
         order: str = "desc",
+        exclude_tags: str | None = None,
         db: Database = Depends(_get_db),
-    ) -> list[dict[str, Any]]:
-        passages = db.list_passages(tag=tag, search=search, limit=limit, order=order)
-        return [
-            {
-                "id": p.id,
-                "text": p.text,
-                "tags": p.tags,
-                "metadata": p.metadata,
-                "created_at": p.created_at,
-            }
-            for p in passages
-        ]
+    ) -> dict[str, Any]:
+        etags = _resolve_exclude_tags(exclude_tags)
+        passages = db.list_passages(tag=tag, search=search, limit=limit, order=order, exclude_tags=etags or None)
+        result: dict[str, Any] = {
+            "passages": [
+                {
+                    "id": p.id,
+                    "text": p.text,
+                    "tags": p.tags,
+                    "metadata": p.metadata,
+                    "created_at": p.created_at,
+                }
+                for p in passages
+            ],
+        }
+        if etags:
+            result["excluded_tags"] = etags
+        return result
 
     @app.post("/api/passages", dependencies=[Depends(_verify_token)], status_code=201)
     async def create_passage(
@@ -256,24 +277,31 @@ def create_app(
         q: str,
         top_k: int = 10,
         profile: str | None = None,
+        exclude_tags: str | None = None,
         db: Database = Depends(_get_db),
         embedder: Embedder = Depends(_get_embedder),
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         # Search embeds the query inline — single call, ~500ms
         if not db.has_vec:
             raise HTTPException(status_code=503, detail="Vector search unavailable: sqlite-vec not loaded")
+        etags = _resolve_exclude_tags(exclude_tags)
         embedding = await embedder.embed(q)
-        passages = db.search_passages(embedding, top_k=top_k, profile_name=profile)
-        return [
-            {
-                "id": p.id,
-                "text": p.text,
-                "tags": p.tags,
-                "metadata": p.metadata,
-                "created_at": p.created_at,
-            }
-            for p in passages
-        ]
+        passages = db.search_passages(embedding, top_k=top_k, profile_name=profile, exclude_tags=etags or None)
+        result: dict[str, Any] = {
+            "passages": [
+                {
+                    "id": p.id,
+                    "text": p.text,
+                    "tags": p.tags,
+                    "metadata": p.metadata,
+                    "created_at": p.created_at,
+                }
+                for p in passages
+            ],
+        }
+        if etags:
+            result["excluded_tags"] = etags
+        return result
 
     @app.get("/api/passages/{passage_id}", dependencies=[Depends(_verify_token)])
     async def get_passage(passage_id: str, db: Database = Depends(_get_db)) -> dict[str, Any]:

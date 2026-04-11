@@ -506,7 +506,9 @@ def _write_rules_file() -> None:
 
     resp = client.get("/api/passages", params={"limit": RECALL_PASSAGE_LIMIT, "order": "desc"})
     resp.raise_for_status()
-    all_passages = [_PassageLike(p) for p in resp.json()]
+    body = resp.json()
+    raw_passages = body["passages"] if isinstance(body, dict) and "passages" in body else body
+    all_passages = [_PassageLike(p) for p in raw_passages]
 
     exchanges = [p for p in all_passages if "exchange" in p.tags]
     summaries = [p for p in all_passages if "summary" in p.tags]
@@ -815,7 +817,8 @@ def status() -> None:
     try:
         resp = client.get("/api/passages", params={"limit": 20, "order": "desc"})
         resp.raise_for_status()
-        passages = resp.json()
+        body = resp.json()
+        passages = body["passages"] if isinstance(body, dict) and "passages" in body else body
     except Exception as e:
         print(f"Failed to connect to yaucca cloud at {base_url}: {e}")
         return

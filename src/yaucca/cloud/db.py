@@ -293,24 +293,28 @@ class Database:
         search: str | None = None,
         limit: int = 50,
         order: str = "desc",
+        exclude_tags: list[str] | None = None,
     ) -> list[Passage]:
         order_dir = "DESC" if order.lower() == "desc" else "ASC"
+        conditions: list[str] = []
+        params: list[object] = []
 
         if tag:
-            rows = self.conn.execute(
-                f"SELECT id, text, tags, metadata, created_at FROM passages WHERE tags LIKE ? ORDER BY created_at {order_dir} LIMIT ?",
-                (f'%"{tag}"%', limit),
-            ).fetchall()
-        elif search:
-            rows = self.conn.execute(
-                f"SELECT id, text, tags, metadata, created_at FROM passages WHERE text LIKE ? ORDER BY created_at {order_dir} LIMIT ?",
-                (f"%{search}%", limit),
-            ).fetchall()
-        else:
-            rows = self.conn.execute(
-                f"SELECT id, text, tags, metadata, created_at FROM passages ORDER BY created_at {order_dir} LIMIT ?",
-                (limit,),
-            ).fetchall()
+            conditions.append("tags LIKE ?")
+            params.append(f'%"{tag}"%')
+        if search:
+            conditions.append("text LIKE ?")
+            params.append(f"%{search}%")
+        for etag in (exclude_tags or []):
+            conditions.append("tags NOT LIKE ?")
+            params.append(f'%"{etag}"%')
+
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(limit)
+        rows = self.conn.execute(
+            f"SELECT id, text, tags, metadata, created_at FROM passages{where} ORDER BY created_at {order_dir} LIMIT ?",
+            params,
+        ).fetchall()
 
         return [self._row_to_passage(r) for r in rows]
 
@@ -319,6 +323,7 @@ class Database:
         embedding: list[float],
         top_k: int = 10,
         profile_name: str | None = None,
+        exclude_tags: list[str] | None = None,
     ) -> list[Passage]:
         """Semantic vector search using sqlite-vec.
 
@@ -326,6 +331,8 @@ class Database:
             embedding: Query embedding (will be truncated to profile dimensions).
             top_k: Number of results.
             profile_name: Which embedding profile to search. Defaults to first active.
+            exclude_tags: Tags to filter out. Since sqlite-vec doesn't support
+                predicate pushdown, we over-fetch and post-filter in Python.
         """
         if not self._has_vec or not self._active_profiles:
             return []
@@ -335,6 +342,9 @@ class Database:
             return []
 
         truncated = embedding[: profile.dimensions]
+
+        # Over-fetch when filtering so we still return top_k results after exclusion
+        fetch_k = top_k * 3 if exclude_tags else top_k
 
         import struct
 
@@ -348,9 +358,17 @@ class Database:
               AND k = ?
             ORDER BY distance
             """,
-            (blob, top_k),
+            (blob, fetch_k),
         ).fetchall()
-        return [self._row_to_passage(r) for r in rows]
+        passages = [self._row_to_passage(r) for r in rows]
+
+        if exclude_tags:
+            passages = [
+                p for p in passages
+                if not any(etag in p.tags for etag in exclude_tags)
+            ]
+
+        return passages[:top_k]
 
     # --- Helpers ---
 

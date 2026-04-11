@@ -91,26 +91,36 @@ def create_remote_mcp(
         return f"Updated memory block '{block_name}'"
 
     @mcp.tool()
-    async def search_archival_memory(query: str, count: int = 10, max_chars: int = 2000) -> str:
+    async def search_archival_memory(
+        query: str,
+        count: int = 10,
+        max_chars: int = 2000,
+        exclude_tags: list[str] | None = None,
+    ) -> str:
         """Search archival memory for past experiences and learnings.
 
         Uses semantic similarity search over all stored memories.
         Returns matching entries ranked by relevance.
+        Server-side default exclusions (e.g. @done) are applied automatically
+        unless exclude_tags is explicitly provided.
 
         Args:
             query: Semantic search query.
             count: Number of results to return.
             max_chars: Max characters per result text (0 = no limit). Default 2000
                        keeps results compact; increase for full passage retrieval.
+            exclude_tags: Tags to filter out. Defaults to server-configured
+                         YAUCCA_DEFAULT_EXCLUDE_TAGS. Pass empty list to include all.
         """
-        from yaucca.cloud.server import _get_db, _get_embedder
+        from yaucca.cloud.server import _get_db, _get_embedder, _resolve_exclude_tags
 
+        etags = _resolve_exclude_tags(",".join(exclude_tags) if exclude_tags is not None else None)
         db = _get_db()
         if not db.has_vec:
             return "Vector search unavailable"
         embedder = _get_embedder()
         embedding = await embedder.embed(query)
-        passages = db.search_passages(embedding, top_k=count)
+        passages = db.search_passages(embedding, top_k=count, exclude_tags=etags or None)
         entries = []
         for p in passages:
             text = p.text
@@ -187,20 +197,30 @@ def create_remote_mcp(
         return str([{"label": b.label, "value_length": len(b.value)} for b in blocks])
 
     @mcp.tool()
-    async def list_passages_by_tag(tag: str, limit: int = 50) -> str:
+    async def list_passages_by_tag(
+        tag: str,
+        limit: int = 50,
+        exclude_tags: list[str] | None = None,
+    ) -> str:
         """List archival passages that have a specific tag.
 
         Useful for retrieving all items with a given classification,
         e.g. all "@inbox" items, all "@next" actions, or all items
         in a project ("project:yaucca-v3").
 
+        Server-side default exclusions (e.g. @done) are applied automatically
+        unless exclude_tags is explicitly provided.
+
         Args:
             tag: The tag to filter by (e.g. "@inbox", "@next", "project:foo").
             limit: Max number of results (default 50).
+            exclude_tags: Tags to filter out. Defaults to server-configured
+                         YAUCCA_DEFAULT_EXCLUDE_TAGS. Pass empty list to include all.
         """
-        from yaucca.cloud.server import _get_db
+        from yaucca.cloud.server import _get_db, _resolve_exclude_tags
 
-        passages = _get_db().list_passages(tag=tag, limit=limit)
+        etags = _resolve_exclude_tags(",".join(exclude_tags) if exclude_tags is not None else None)
+        passages = _get_db().list_passages(tag=tag, limit=limit, exclude_tags=etags or None)
         results = []
         for p in passages:
             entry: dict[str, object] = {"id": p.id, "text": p.text, "tags": p.tags}
