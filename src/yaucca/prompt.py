@@ -214,11 +214,16 @@ def render_full_context(
     Combines memory blocks, metadata, conversation history, archival
     summaries, and tagged sections into a single string for the rules file.
 
-    Budget strategy (to stay under max_output_chars):
-    1. Memory blocks + metadata — always included (small, essential)
-    2. Tagged sections — configurable, surfaced items (e.g. @next, @inbox)
-    3. Conversation history — fill remaining budget with most recent exchanges
-    4. Archival summaries — fill any leftover budget
+    Rendering order (top to bottom of file):
+    1. Memory blocks + metadata — stable reference, always first
+    2. Archival summaries — session summaries, background context
+    3. Tagged sections — surfaced items (e.g. @next, @inbox)
+    4. Conversation history — LAST, so it's closest to the conversation
+       boundary when loaded into context. This maximizes attention to
+       recent exchanges for seamless session continuity.
+
+    Budget strategy: conversation history gets the lion's share after
+    fixed sections are allocated.
     """
     memory_blocks_section = render_memory_blocks(blocks)
     memory_metadata_section = render_memory_metadata(archival_count, exchange_count)
@@ -227,7 +232,11 @@ def render_full_context(
     fixed = memory_blocks_section + "\n\n" + memory_metadata_section + "\n\n"
     remaining = max_output_chars - len(fixed)
 
-    # Tagged sections get budget before conversation history
+    # Archival summaries — background context, render early (gets buried = fine)
+    archival_section = render_archival_summaries(summaries, max_chars=min(remaining, 10_000))
+    remaining -= len(archival_section) + 2
+
+    # Tagged sections
     tag_sections_text = ""
     if tagged_sections:
         per_section_budget = min(20_000, remaining // (len(tagged_sections) + 2))
@@ -237,16 +246,13 @@ def render_full_context(
                 tag_sections_text += section + "\n\n"
         remaining -= len(tag_sections_text)
 
-    # Conversation history gets priority over archival summaries.
-    conversation_section = render_conversation_history(exchanges, max_chars=max(remaining - 2000, 0))
-    remaining -= len(conversation_section) + 2  # +2 for "\n\n"
-
-    archival_section = render_archival_summaries(summaries, max_chars=max(remaining, 0))
+    # Conversation history — LAST so it's adjacent to the live conversation
+    conversation_section = render_conversation_history(exchanges, max_chars=max(remaining, 0))
 
     parts = [fixed]
+    parts.append(archival_section)
     if tag_sections_text:
         parts.append(tag_sections_text)
     parts.append(conversation_section)
-    parts.append(archival_section)
 
     return "\n\n".join(parts)

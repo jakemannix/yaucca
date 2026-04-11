@@ -516,7 +516,7 @@ def _write_rules_file() -> None:
 
     # Fetch configurable tagged sections (e.g. @next, @inbox)
     tagged_sections: dict[str, list[Any]] = {}
-    sessionstart_tags = os.environ.get("YAUCCA_SESSIONSTART_TAGS", "")
+    sessionstart_tags = get_settings().cloud.sessionstart_tags
     for tag in [t.strip() for t in sessionstart_tags.split(",") if t.strip()]:
         try:
             resp = client.get("/api/passages", params={"tag": tag, "limit": 50, "order": "desc"})
