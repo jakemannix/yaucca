@@ -485,63 +485,103 @@ class _BlockLike:
 # --- Hook handlers ---
 
 
+# Canary string that must appear in Claude's context to verify the rules file loaded.
+MEMORY_CANARY = "YAUCCA_MEMORY_LOADED_OK"
+
+# Where we write dynamic memory context (auto-loaded by CC as a rules file).
+RULES_CONTEXT_FILE = Path.home() / ".claude" / "rules" / "yaucca-context.md"
+
+
+def _write_rules_file() -> None:
+    """Query cloud for current state and write the rules file for next session.
+
+    Called from session_end (background worker) to prepare fresh context for
+    the next CC session, and from session_start as a fallback on first run.
+    """
+    client, _ = _cloud_client()
+
+    resp = client.get("/api/blocks")
+    resp.raise_for_status()
+    blocks = [_BlockLike(b) for b in resp.json()]
+
+    resp = client.get("/api/passages", params={"limit": RECALL_PASSAGE_LIMIT, "order": "desc"})
+    resp.raise_for_status()
+    all_passages = [_PassageLike(p) for p in resp.json()]
+
+    exchanges = [p for p in all_passages if "exchange" in p.tags]
+    summaries = [p for p in all_passages if "summary" in p.tags]
+    other = [p for p in all_passages if p not in exchanges and p not in summaries]
+
+    context = render_full_context(
+        blocks=blocks,
+        exchanges=exchanges,
+        summaries=summaries + other,
+        archival_count=len(all_passages),
+        exchange_count=len(exchanges),
+    )
+
+    RULES_CONTEXT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    file_content = "# yaucca Dynamic Memory Context\n\n"
+    file_content += f"<!-- {MEMORY_CANARY} -->\n\n"
+    file_content += context
+    RULES_CONTEXT_FILE.write_text(file_content)
+    logger.info(
+        "Wrote rules file: %d chars to %s (%d blocks, %d exchanges, %d summaries)",
+        len(file_content),
+        RULES_CONTEXT_FILE,
+        len(blocks),
+        len(exchanges),
+        len(summaries + other),
+    )
+
+
 def session_start(hook_input: dict[str, Any]) -> None:
-    """Handle SessionStart hook: inject memory context into Claude Code.
+    """Handle SessionStart hook: verify memory context and cloud health.
 
-    Queries yaucca cloud for all memory blocks and recent tagged passages, splits
-    them into exchanges and summaries, and renders as XML for additionalContext.
+    The rules file is written by session_end (previous session's background
+    worker), so CC loads it before this hook fires. This hook just verifies
+    the file exists, checks cloud health (fail-fast), and outputs a small
+    status message via additionalContext.
 
-    When YAUCCA_REQUIRED=true, exits non-zero if cloud is unreachable (failing the
-    Claude Code session). Otherwise, degrades silently.
+    On first-ever session (no rules file), writes one as a fallback.
     """
     if os.environ.get("YAUCCA_SKIP_HOOKS"):
         return
 
-    settings = get_settings()
-    required = settings.cloud.required
     source = hook_input.get("source", "startup")
-    logger.info("SessionStart (source=%s, required=%s)", source, required)
+    logger.info("SessionStart (source=%s)", source)
 
     try:
         client, _ = _cloud_client()
-
-        # Fetch memory blocks
-        resp = client.get("/api/blocks")
-        resp.raise_for_status()
-        blocks = [_BlockLike(b) for b in resp.json()]
-
-        # Fetch recent passages
-        resp = client.get("/api/passages", params={"limit": RECALL_PASSAGE_LIMIT, "order": "desc"})
-        resp.raise_for_status()
-        all_passages = [_PassageLike(p) for p in resp.json()]
-
-        # Split passages by tag
-        exchanges = [p for p in all_passages if "exchange" in p.tags]
-        summaries = [p for p in all_passages if "summary" in p.tags]
-        other = [p for p in all_passages if p not in exchanges and p not in summaries]
-
-        context = render_full_context(
-            blocks=blocks,
-            exchanges=exchanges,
-            summaries=summaries + other,
-            archival_count=len(all_passages),
-            exchange_count=len(exchanges),
-        )
-
-        # Output to stdout for additionalContext
-        print(context)
-        logger.info(
-            "Injected %d blocks, %d exchanges, %d summaries",
-            len(blocks),
-            len(exchanges),
-            len(summaries + other),
-        )
-
+        client.get("/health").raise_for_status()
     except Exception as e:
-        if required:
-            logger.error("FATAL: Memory unavailable (YAUCCA_REQUIRED=true): %s", e)
+        logger.error("FATAL: Cloud unreachable: %s", e)
+        sys.exit(1)
+
+    if RULES_CONTEXT_FILE.exists():
+        content = RULES_CONTEXT_FILE.read_text()
+        has_canary = MEMORY_CANARY in content
+        print(
+            f"yaucca memory context loaded from rules file "
+            f"({len(content)} chars, canary={'OK' if has_canary else 'MISSING'}).\n\n"
+            f"CRITICAL: If you do NOT see '{MEMORY_CANARY}' elsewhere in your context "
+            f"(in a rules file, NOT in this message), STOP and tell the user: "
+            f"'yaucca memory injection is broken — the rules file at "
+            f"{RULES_CONTEXT_FILE} was written but Claude Code did not load it. "
+            f"Check that .claude/rules/ files are being loaded.'"
+        )
+    else:
+        # First session — write rules file so it's ready for next restart
+        try:
+            _write_rules_file()
+            print(
+                f"yaucca: first session — memory context written to {RULES_CONTEXT_FILE}. "
+                f"Context will be loaded on next session start. "
+                f"Restart Claude Code to activate memory."
+            )
+        except Exception as e:
+            logger.error("FATAL: Failed to write initial rules file: %s", e)
             sys.exit(1)
-        logger.warning("Failed to load memory from yaucca cloud: %s", e)
 
 
 def stop(hook_input: dict[str, Any]) -> None:
@@ -621,104 +661,114 @@ def _session_end_worker(
     project_name: str,
     cwd: str,
 ) -> None:
-    """Background worker for session summarization (Layers 2+3).
+    """Background worker for session end tasks.
 
     Runs in a detached subprocess so it survives Claude Code's session exit.
-    Reads the transcript, calls claude -p, and persists summary + context block.
+
+    1. Summarization (Layers 2+3) — if enabled and threshold met:
+       calls claude -p, persists summary + updates context block.
+    2. Rules file writing — always: queries cloud and writes fresh
+       context to the rules file for the next CC session.
     """
     settings = get_settings()
     summary_config = settings.summary
 
-    # Extract all turns for full-session summary
-    all_turns, _, total_lines = _extract_turns(transcript_path, start_line=0)
-    if not all_turns:
-        logger.debug("No turns to summarize")
-        return
-
-    # Check minimum threshold — skip summarization for trivially short sessions
-    if not _should_summarize(
-        len(all_turns), sum(len(t.format()) for t in all_turns),
-        summary_config.min_exchanges, summary_config.min_chars,
-    ):
-        logger.info("Session too short for summarization (%d turns)", len(all_turns))
-        return
-
-    # Connect to cloud API
     try:
-        client, _ = _cloud_client()
-        client.get("/health").raise_for_status()
-    except Exception as e:
-        logger.error("Failed to connect to yaucca cloud: %s", e)
-        return
+        # Summarization (skip if disabled)
+        if not summary_config.enabled:
+            return
 
-    # Single claude -p call for both summary + context block
-    prompt = _build_summary_prompt(
-        all_turns, project_name, cwd, session_id, summary_config.max_transcript_chars
-    )
-    raw_response = _summarize_with_claude(prompt, summary_config)
+        # Extract all turns for full-session summary
+        all_turns, _, total_lines = _extract_turns(transcript_path, start_line=0)
+        if not all_turns:
+            logger.debug("No turns to summarize")
+            return
 
-    if not raw_response:
-        logger.error("Summarization failed — raw turns were already persisted by Stop hook")
-        return
+        # Check minimum threshold — skip summarization for trivially short sessions
+        if not _should_summarize(
+            len(all_turns), sum(len(t.format()) for t in all_turns),
+            summary_config.min_exchanges, summary_config.min_chars,
+        ):
+            logger.info("Session too short for summarization (%d turns)", len(all_turns))
+            return
 
-    summary, context_value = _parse_summary_response(raw_response)
-
-    # Load session state for summary passage tracking
-    state = _load_session_state(session_id)
-
-    # Layer 2: Persist the archival summary
-    if summary:
-        passage_id = _persist_summary(
-            client,
-            summary,
-            state.last_summary_passage_id,
-            session_id,
-            project_name,
-        )
-
-        state.last_summary_ts = datetime.now(UTC).isoformat()
-        state.last_summary_exchange_count = len(all_turns)
-        state.last_summary_line_offset = total_lines
-        if passage_id:
-            state.last_summary_passage_id = passage_id
-
-        logger.info("Persisted LLM-generated session summary (%d turns)", len(all_turns))
-
-    # Layer 3: Update the context memory block
-    if context_value:
+        # Connect to cloud API
         try:
-            resp = client.put("/api/blocks/context", json={"value": context_value})
-            resp.raise_for_status()
-            logger.info("Updated context memory block (%d chars)", len(context_value))
+            client, _ = _cloud_client()
+            client.get("/health").raise_for_status()
         except Exception as e:
-            logger.warning("Failed to update context block: %s", e)
+            logger.error("Failed to connect to yaucca cloud: %s", e)
+            return
 
-    _save_session_state(state)
+        # Single claude -p call for both summary + context block
+        prompt = _build_summary_prompt(
+            all_turns, project_name, cwd, session_id, summary_config.max_transcript_chars
+        )
+        raw_response = _summarize_with_claude(prompt, summary_config)
+
+        if not raw_response:
+            logger.error("Summarization failed — raw turns were already persisted by Stop hook")
+            return
+
+        summary, context_value = _parse_summary_response(raw_response)
+
+        # Load session state for summary passage tracking
+        state = _load_session_state(session_id)
+
+        # Layer 2: Persist the archival summary
+        if summary:
+            passage_id = _persist_summary(
+                client,
+                summary,
+                state.last_summary_passage_id,
+                session_id,
+                project_name,
+            )
+
+            state.last_summary_ts = datetime.now(UTC).isoformat()
+            state.last_summary_exchange_count = len(all_turns)
+            state.last_summary_line_offset = total_lines
+            if passage_id:
+                state.last_summary_passage_id = passage_id
+
+            logger.info("Persisted LLM-generated session summary (%d turns)", len(all_turns))
+
+        # Layer 3: Update the context memory block
+        if context_value:
+            try:
+                resp = client.put("/api/blocks/context", json={"value": context_value})
+                resp.raise_for_status()
+                logger.info("Updated context memory block (%d chars)", len(context_value))
+            except Exception as e:
+                logger.warning("Failed to update context block: %s", e)
+
+        _save_session_state(state)
+
+    finally:
+        # Always write the rules file for next session's context
+        try:
+            _write_rules_file()
+        except Exception as e:
+            logger.error("Failed to write rules file for next session: %s", e)
 
 
 def session_end(hook_input: dict[str, Any]) -> None:
-    """Handle SessionEnd hook: fork a detached worker for summarization.
+    """Handle SessionEnd hook: fork a detached worker for summarization + rules file.
 
     Claude Code's SessionEnd has a very short timeout (~1.5s) that kills hooks
-    quickly. We can't run claude -p inline. Instead, we fork a detached subprocess
-    that runs _session_end_worker and survives the parent's exit.
+    quickly. We fork a detached subprocess that runs _session_end_worker and
+    survives the parent's exit. The worker always writes the rules file (for
+    next session's context) and optionally does summarization.
     """
     if os.environ.get("YAUCCA_SKIP_HOOKS"):
         return
 
     transcript_path = hook_input.get("transcript_path", "")
-    if not transcript_path or not Path(transcript_path).exists():
-        return
-
     session_id = hook_input.get("session_id", "unknown")
     cwd = hook_input.get("cwd", "")
     project_name = Path(cwd).name if cwd else "unknown"
 
-    settings = get_settings()
-    if not settings.summary.enabled:
-        return
-
-    logger.info("SessionEnd: forking background summarization worker")
+    logger.info("SessionEnd: forking background worker")
 
     # Fork a detached subprocess that calls _session_end_worker via CLI.
     # This survives Claude Code's process exit.

@@ -13,6 +13,11 @@ BLOCK_ORDER = ["user", "projects", "patterns", "learnings", "context"]
 # How many recent passages to inject into context
 RECALL_PASSAGE_LIMIT = 30
 
+# Maximum characters for the rendered context written to the rules file.
+# With a 1M token context window, we can afford a generous budget.
+# 200K chars ≈ 50K tokens, leaving plenty of room for conversation.
+MAX_OUTPUT_CHARS = 200_000
+
 
 def render_memory_blocks(blocks: list[Any]) -> str:
     """Render the <memory_blocks> section in Letta's XML format.
@@ -68,54 +73,98 @@ def render_memory_metadata(archival_count: int, exchange_count: int) -> str:
     return "\n".join(lines)
 
 
-def render_conversation_history(exchanges: list[Any]) -> str:
+def render_conversation_history(exchanges: list[Any], max_chars: int | None = None) -> str:
     """Render the <conversation_history> section from persisted exchanges.
 
     Each exchange is a Passage with text in "User: ...\nAssistant: ..." format.
-    Rendered in chronological order (oldest first).
+    Rendered in chronological order (oldest first), keeping the most recent
+    exchanges that fit within max_chars. If max_chars is None, no limit.
     """
-    lines = ["<conversation_history>", "Recent conversation exchanges:", ""]
+    header = "<conversation_history>\nRecent conversation exchanges:\n\n"
+    footer = "\n</conversation_history>"
+    overhead = len(header) + len(footer)
 
-    if exchanges:
-        # Reverse so oldest is first (passages come in descending order)
-        for passage in reversed(exchanges):
-            text = getattr(passage, "text", str(passage)) or ""
-            created = getattr(passage, "created_at", None)
-            if created:
-                lines.append(f"[{created}] {text}")
-            else:
-                lines.append(text)
-            lines.append("")
-    else:
-        lines.append("(No previous conversation exchanges found.)")
-        lines.append("")
+    if not exchanges:
+        return header + "(No previous conversation exchanges found.)\n" + footer
 
-    lines.append("</conversation_history>")
-    return "\n".join(lines)
+    # Render each exchange (passages come descending = newest first)
+    rendered: list[str] = []
+    for passage in exchanges:
+        text = getattr(passage, "text", str(passage)) or ""
+        created = getattr(passage, "created_at", None)
+        entry = f"[{created}] {text}\n" if created else f"{text}\n"
+        rendered.append(entry)
+
+    # Keep most recent exchanges that fit in the budget.
+    # rendered[0] is newest; we walk from newest to oldest, then reverse.
+    budget = (max_chars - overhead) if max_chars is not None else None
+    kept: list[str] = []
+    used = 0
+    for entry in rendered:
+        if budget is not None and used + len(entry) > budget:
+            break
+        kept.append(entry)
+        used += len(entry)
+
+    if not kept:
+        return header + "(Exchanges too large to fit in budget.)\n" + footer
+
+    # Reverse to chronological order (oldest first)
+    kept.reverse()
+    skipped = len(exchanges) - len(kept)
+    body = ""
+    if skipped:
+        body += f"[... {skipped} older exchanges omitted ...]\n\n"
+    body += "\n".join(kept)
+
+    return header + body + footer
 
 
-def render_archival_summaries(summaries: list[Any]) -> str:
+def render_archival_summaries(summaries: list[Any], max_chars: int | None = None) -> str:
     """Render the <archival_memory> section from session summaries and other passages.
 
-    Summaries are rendered newest-first (as returned from Letta).
+    Summaries come from the cloud in descending order (newest first).
+    We keep the most recent that fit in the budget, then reverse to
+    chronological order so the newest is at the bottom (closest to
+    the current conversation).
     """
-    lines = ["<archival_memory>", "Session summaries and archival memories:", ""]
+    header = "<archival_memory>\nSession summaries and archival memories:\n\n"
+    footer = "\n</archival_memory>"
+    overhead = len(header) + len(footer)
 
-    if summaries:
-        for passage in summaries:
-            text = getattr(passage, "text", str(passage)) or ""
-            created = getattr(passage, "created_at", None)
-            if created:
-                lines.append(f"[{created}] {text}")
-            else:
-                lines.append(text)
-            lines.append("")
-    else:
-        lines.append("(No archival memories found.)")
-        lines.append("")
+    if not summaries:
+        return header + "(No archival memories found.)\n" + footer
 
-    lines.append("</archival_memory>")
-    return "\n".join(lines)
+    # Render each summary (input is newest-first from cloud)
+    rendered: list[str] = []
+    for passage in summaries:
+        text = getattr(passage, "text", str(passage)) or ""
+        created = getattr(passage, "created_at", None)
+        entry = f"[{created}] {text}\n" if created else f"{text}\n"
+        rendered.append(entry)
+
+    # Keep most recent that fit in budget (walk newest to oldest)
+    budget = (max_chars - overhead) if max_chars is not None else None
+    kept: list[str] = []
+    used = 0
+    for entry in rendered:
+        if budget is not None and used + len(entry) > budget:
+            break
+        kept.append(entry)
+        used += len(entry)
+
+    if not kept:
+        return header + "(Summaries too large to fit in remaining budget.)\n" + footer
+
+    # Reverse to chronological order (oldest first, newest at bottom)
+    kept.reverse()
+    skipped = len(summaries) - len(kept)
+    body = ""
+    if skipped:
+        body += f"[... {skipped} older summaries omitted ...]\n\n"
+    body += "\n".join(kept)
+
+    return header + body + footer
 
 
 def render_full_context(
@@ -124,23 +173,35 @@ def render_full_context(
     summaries: list[Any],
     archival_count: int,
     exchange_count: int,
+    max_output_chars: int = MAX_OUTPUT_CHARS,
 ) -> str:
     """Render the complete memory context for injection into Claude Code.
 
     Combines memory blocks, metadata, conversation history, and archival
     summaries into a single string suitable for additionalContext output
     from a SessionStart hook.
+
+    Budget strategy (to stay under max_output_chars for inline injection):
+    1. Memory blocks + metadata — always included (small, essential)
+    2. Conversation history — fill remaining budget with most recent exchanges
+    3. Archival summaries — fill any leftover budget
     """
     memory_blocks_section = render_memory_blocks(blocks)
     memory_metadata_section = render_memory_metadata(archival_count, exchange_count)
-    conversation_section = render_conversation_history(exchanges)
-    archival_section = render_archival_summaries(summaries)
+
+    # Fixed overhead: blocks + metadata + separators
+    fixed = memory_blocks_section + "\n\n" + memory_metadata_section + "\n\n"
+    remaining = max_output_chars - len(fixed)
+
+    # Conversation history gets priority over archival summaries.
+    # Render with the most recent exchanges, trimming older ones to fit.
+    conversation_section = render_conversation_history(exchanges, max_chars=max(remaining - 2000, 0))
+    remaining -= len(conversation_section) + 2  # +2 for "\n\n"
+
+    archival_section = render_archival_summaries(summaries, max_chars=max(remaining, 0))
 
     return (
-        memory_blocks_section
-        + "\n\n"
-        + memory_metadata_section
-        + "\n\n"
+        fixed
         + conversation_section
         + "\n\n"
         + archival_section

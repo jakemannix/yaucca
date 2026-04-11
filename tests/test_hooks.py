@@ -17,6 +17,7 @@ from yaucca.hooks import (
     _save_session_state,
     _should_summarize,
     _summarize_with_claude,
+    _write_rules_file,
     session_start,
     stop,
 )
@@ -39,22 +40,19 @@ def _mock_cloud_settings(url: str = "http://localhost:8283", auth_token: str | N
     return mock
 
 
-class TestSessionStart:
-    def test_outputs_memory_context(self, capsys: pytest.CaptureFixture[str]) -> None:
+class TestWriteRulesFile:
+    def test_writes_rules_file(self, tmp_path: Path) -> None:
+        rules_file = tmp_path / "yaucca-context.md"
         mock_client = MagicMock()
-        # Mock blocks response
         blocks_resp = MagicMock()
         blocks_resp.json.return_value = [
             {"label": "user", "value": "Jake", "description": "User info", "limit": 5000},
-            {"label": "context", "value": "Working", "description": "Context", "limit": 5000},
         ]
         blocks_resp.raise_for_status = MagicMock()
 
-        # Mock passages response
         passages_resp = MagicMock()
         passages_resp.json.return_value = [
             {"id": "p1", "text": "User: Hi\nAssistant: Hello", "tags": ["exchange"], "metadata": {}, "created_at": "2024-01-15"},
-            {"id": "p2", "text": "Session summary", "tags": ["summary"], "metadata": {}, "created_at": "2024-01-15"},
         ]
         passages_resp.raise_for_status = MagicMock()
 
@@ -62,31 +60,81 @@ class TestSessionStart:
 
         with (
             patch("yaucca.hooks._cloud_client", return_value=(mock_client, "http://localhost:8283")),
+            patch("yaucca.hooks.RULES_CONTEXT_FILE", rules_file),
+        ):
+            _write_rules_file()
+
+            file_content = rules_file.read_text()
+            assert "<memory_blocks>" in file_content
+            assert "<memory_metadata>" in file_content
+            assert "<conversation_history>" in file_content
+            assert "YAUCCA_MEMORY_LOADED_OK" in file_content
+
+
+class TestSessionStart:
+    def test_verifies_existing_rules_file(self, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+        """When rules file exists (from previous session_end), verify and report."""
+        rules_file = tmp_path / "yaucca-context.md"
+        rules_file.write_text("# yaucca Dynamic Memory Context\n\n<!-- YAUCCA_MEMORY_LOADED_OK -->\n\ncontent here")
+
+        mock_client = MagicMock()
+        health_resp = MagicMock()
+        health_resp.raise_for_status = MagicMock()
+        mock_client.get.return_value = health_resp
+
+        with (
+            patch("yaucca.hooks._cloud_client", return_value=(mock_client, "http://localhost:8283")),
+            patch("yaucca.hooks.RULES_CONTEXT_FILE", rules_file),
             patch.dict("os.environ", {}, clear=False),
         ):
             session_start({"source": "startup"})
 
             output = capsys.readouterr().out
-            assert "<memory_blocks>" in output
-            assert "<memory_metadata>" in output
-            assert "<conversation_history>" in output
+            assert "yaucca memory context loaded from rules file" in output
+            assert "canary=OK" in output
 
-    def test_cloud_unreachable_optional(self, capsys: pytest.CaptureFixture[str]) -> None:
-        """When YAUCCA_REQUIRED is false (default), cloud failure degrades silently."""
+    def test_first_session_writes_rules_file(self, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+        """First session (no rules file) writes one as fallback."""
+        rules_file = tmp_path / "yaucca-context.md"
+
+        mock_client = MagicMock()
+        health_resp = MagicMock()
+        health_resp.raise_for_status = MagicMock()
+        blocks_resp = MagicMock()
+        blocks_resp.json.return_value = [
+            {"label": "user", "value": "Jake", "description": "User info", "limit": 5000},
+        ]
+        blocks_resp.raise_for_status = MagicMock()
+        passages_resp = MagicMock()
+        passages_resp.json.return_value = []
+        passages_resp.raise_for_status = MagicMock()
+
+        def mock_get(path, **kw):
+            if path == "/health":
+                return health_resp
+            if path == "/api/blocks":
+                return blocks_resp
+            return passages_resp
+
+        mock_client.get.side_effect = mock_get
+
         with (
-            patch("yaucca.hooks._cloud_client", side_effect=Exception("Connection refused")),
-            patch("yaucca.hooks.get_settings", return_value=_mock_cloud_settings(required=False)),
+            patch("yaucca.hooks._cloud_client", return_value=(mock_client, "http://localhost:8283")),
+            patch("yaucca.hooks.RULES_CONTEXT_FILE", rules_file),
             patch.dict("os.environ", {}, clear=False),
         ):
             session_start({"source": "startup"})
-            output = capsys.readouterr().out
-            assert output == ""
 
-    def test_cloud_unreachable_required(self) -> None:
-        """When YAUCCA_REQUIRED is true, cloud failure exits non-zero."""
+            assert rules_file.exists()
+            assert "YAUCCA_MEMORY_LOADED_OK" in rules_file.read_text()
+
+            output = capsys.readouterr().out
+            assert "first session" in output
+
+    def test_cloud_unreachable_exits_nonzero(self) -> None:
+        """Cloud failure always exits non-zero — no silent degradation."""
         with (
             patch("yaucca.hooks._cloud_client", side_effect=Exception("Connection refused")),
-            patch("yaucca.hooks.get_settings", return_value=_mock_cloud_settings(required=True)),
             patch.dict("os.environ", {}, clear=False),
             pytest.raises(SystemExit) as exc_info,
         ):

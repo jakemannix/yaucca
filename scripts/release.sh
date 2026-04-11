@@ -39,7 +39,7 @@ git push && git push --tags
 # Create GitHub release (triggers PyPI publish via Actions)
 echo ""
 echo "Creating GitHub release v$NEW..."
-gh release create "v$NEW" --title "v$NEW" --generate-notes
+GITHUB_TOKEN= gh release create "v$NEW" --title "v$NEW" --generate-notes
 
 echo ""
 echo "Released v$NEW → PyPI publish triggered."

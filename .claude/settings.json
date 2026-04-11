@@ -3,41 +3,5 @@
     "allow": [
       "mcp__yaucca"
     ]
-  },
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "startup|resume|compact|clear",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python -m yaucca.hooks session_start",
-            "timeout": 30
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python -m yaucca.hooks stop",
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python -m yaucca.hooks session_end",
-            "timeout": 120
-          }
-        ]
-      }
-    ]
   }
 }
